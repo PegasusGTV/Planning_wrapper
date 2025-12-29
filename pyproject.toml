@@ -5,14 +5,55 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "planning-wrapper"
 version = "0.1.0"
-description = "Planning wrapper for ManiSkill environments"
+description = "Planning wrapper for ManiSkill environments with state cloning, planning observations, and task adapters"
 readme = "README.md"
 requires-python = ">=3.9"
-dependencies = []
+license = {text = "MIT"}
+authors = [
+    {name = "Planning Wrapper Contributors"}
+]
+keywords = [
+    "robotics",
+    "manipulation",
+    "planning",
+    "maniskill",
+    "reinforcement-learning",
+    "simulation"
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Robotics",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "numpy>=1.22.0",
+    "gymnasium>=0.29.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "black>=23.0.0",
+    "isort>=5.12.0",
+    "mypy>=1.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/PegasusGTV/Planning_wrapper"
+Repository = "https://github.com/PegasusGTV/Planning_wrapper"
+Issues = "https://github.com/PegasusGTV/Planning_wrapper/issues"
+
+[project.scripts]
 
 [tool.setuptools]
 packages = ["planning_wrapper"]
 
 [tool.setuptools.package-data]
 "*" = ["*.py", "*.yaml", "*.yml"]
-
