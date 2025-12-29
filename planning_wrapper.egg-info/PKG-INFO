@@ -1,6 +1,0 @@
-Metadata-Version: 2.4
-Name: planning-wrapper
-Version: 0.1.0
-Summary: Planning wrapper for ManiSkill environments
-Requires-Python: >=3.9
-Description-Content-Type: text/markdown
