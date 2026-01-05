@@ -72,15 +72,21 @@ class ManiSkillPlanningWrapper:
         qpos = np.asarray(agent["qpos"], dtype=np.float32).copy()
         qvel = np.asarray(agent["qvel"], dtype=np.float32).copy()
 
-        missing_extra = [k for k in ["tcp_pose", "goal_pos", "obj_pose"] if k not in extra]
+        # Required keys for planning observation
+        required_keys = ["tcp_pose", "goal_pos", "obj_pose"]
+        missing_extra = [k for k in required_keys if k not in extra]
         if missing_extra:
+            env_name = getattr(self.root, "spec", None)
+            env_id = getattr(env_name, "id", None) if env_name else None
+            env_hint = f" for {env_id}" if env_id else ""
             raise KeyError(
                 f"obs['extra'] missing required keys for planning_obs: {missing_extra}. "
-                "Make sure obs_mode='state_dict' for PushT."
+                f"Make sure obs_mode='state_dict'{env_hint}."
             )
-        obj_pose = np.asarray(extra["obj_pose"], dtype=np.float32).copy()
-        goal_pos = np.asarray(extra["goal_pos"], dtype=np.float32).copy()
+        
         tcp_pose = np.asarray(extra["tcp_pose"], dtype=np.float32).copy()
+        goal_pos = np.asarray(extra["goal_pos"], dtype=np.float32).copy()
+        obj_pose = np.asarray(extra["obj_pose"], dtype=np.float32).copy()
         
         planning_obs = {
             "qpos": qpos,
