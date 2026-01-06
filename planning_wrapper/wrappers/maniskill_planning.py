@@ -6,10 +6,10 @@ import numpy as np
 from ..adapters import BaseTaskAdapter
 
 class ManiSkillPlanningWrapper:
-    def __init__(self, env: Any, adapter: Optional[BaseTaskAdapter] = None):
+    def __init__(self, env: Any, adapter: Optional[BaseTaskAdapter] = None, hide_obj_orientation: bool = False):
         self.env = env
         self.adapter = adapter
-
+        self.hide_obj_orientation = hide_obj_orientation
         self.root = self.env.unwrapped
         self.agent = getattr(self.root, "agent", None)
 
@@ -206,15 +206,40 @@ class ManiSkillPlanningWrapper:
         print("\nController repr:")
         print(self.controller)
         print("=== End summary ===\n")
+
+    def _filter_obs(self, obs):
+        if not self.hide_obj_orientation:
+            return obs
+        if not isinstance(obs, dict) or "extra" not in obs:
+            return obs
+        extra = obs.get("extra", None)
+        if not isinstance(extra, dict) or "obj_pose" not in extra:
+            return obs
+
+        obj_pose = np.asarray(extra["obj_pose"], dtype=np.float32).copy()
+        if obj_pose.shape[-1] >= 7:
+            obj_pose[..., 3:7] = np.array([0, 0, 0, 1], dtype=np.float32)
+
+        # write back (copy dicts so you don't mutate shared references)
+        obs2 = dict(obs)
+        extra2 = dict(extra)
+        extra2["obj_pose"] = obj_pose
+        obs2["extra"] = extra2
+        return obs2
         
     def reset(self, *args, **kwargs):
-        return self.root.reset(*args, **kwargs)
+        # Use the wrapped env to respect outer wrappers (viewer/step hooks, etc.)
+        obs, info = self.env.reset(*args, **kwargs)
+        return self._filter_obs(obs), info
     
     def step(self, action: np.ndarray):
-        return self.root.step(action)
+        # Step through the wrapped env (not the unwrapped root) for wrapper behavior
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        return self._filter_obs(obs), reward, terminated, truncated, info
     
     def close(self):
-        return self.root.close()
+        # Close via the wrapped env to respect any outer wrapper hooks
+        return self.env.close()
 
     def __getattr__(self, name):
         return getattr(self.root, name)

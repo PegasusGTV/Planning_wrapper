@@ -22,7 +22,7 @@ from planning_wrapper.wrappers.maniskill_planning import ManiSkillPlanningWrappe
 from planning_wrapper.adapters.shelf_retrieve import ShelfRetrieveTaskAdapter
 
 
-MAX_STEPS = 200
+MAX_STEPS = 1000
 APPROACH_STEP_SIZE = 0.02  # meters per step when approaching object
 PULL_STEP_SIZE = 0.015  # meters per step when pulling object
 APPROACH_DIST = 0.08  # distance to maintain from object

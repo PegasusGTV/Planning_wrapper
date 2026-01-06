@@ -72,6 +72,9 @@ def main():
         "PushT-v1",
         obs_mode="state_dict",
         control_mode="pd_ee_delta_pose",
+        # Override ManiSkill's default 100-step TimeLimit so the episode
+        # does not truncate at t=99 while our loop is still running.
+        max_episode_steps=MAX_STEPS,
         render_mode="human",  # or "rgb_array" depending on your setup
     )
 

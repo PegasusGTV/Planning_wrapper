@@ -53,6 +53,8 @@ def main():
         "PushT-v1",
         obs_mode="state_dict",
         control_mode="pd_ee_delta_pose",
+        # Allow longer rollouts than the default 100-step TimeLimit.
+        max_episode_steps=MAX_STEPS,
         render_mode="human",
     )
 
