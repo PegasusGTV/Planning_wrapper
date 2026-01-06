@@ -241,6 +241,28 @@ class ManiSkillPlanningWrapper:
         # Close via the wrapped env to respect any outer wrapper hooks
         return self.env.close()
 
+    def get_controller_bounds(self) -> tuple:
+        """
+        Get the original (unnormalized) action bounds for the controller.
+        Returns (low, high) tuple for position control bounds.
+        For pd_ee_delta_pose, this is typically (-0.1, 0.1) for position.
+        """
+        if self.controller is None:
+            raise RuntimeError("Controller not found on agent.")
+        
+        # Try to get bounds from the arm controller if it's a CombinedController
+        if hasattr(self.controller, "controllers") and "arm" in self.controller.controllers:
+            arm_controller = self.controller.controllers["arm"]
+            if hasattr(arm_controller, "action_space_low") and hasattr(arm_controller, "action_space_high"):
+                # Get position bounds (first 3 dims)
+                low = arm_controller.action_space_low[0:3].cpu().numpy()
+                high = arm_controller.action_space_high[0:3].cpu().numpy()
+                # For pd_ee_delta_pose, bounds should be the same for all 3 dims
+                return (float(low[0]), float(high[0]))
+        
+        # Default bounds for pd_ee_delta_pose (from panda_stick config)
+        return (-0.1, 0.1)
+    
     def __getattr__(self, name):
         return getattr(self.root, name)
     

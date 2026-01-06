@@ -21,13 +21,13 @@ from planning_wrapper.adapters import PushTTaskAdapter
 # ----- Tuning knobs (aggressive enough to make real contact) -----
 MAX_STEPS = 1000
 RENDER_SLEEP = 0.02    # ~50 FPS
-STEP_SIZE = 0.05      # a bit larger step for clearer motion
+STEP_SIZE = 0.04      # slightly smaller step but more controlled
 
 # Get closer and slightly lower so the stick actually hits the T block.
-BACKOFF = 0.018        # start just behind the object
-ABOVE_Z = 0.0         # approach height
-PUSH_Z_OFFSET = 0.002  # near mid-height of the block
-CONTACT_EPS = 0.003    # how far "into" the block face we aim before pushing
+BACKOFF = 0.010        # closer behind the tee
+ABOVE_Z = 0.03         # approach clearly above the tee
+PUSH_Z_OFFSET = -0.005  # push a bit *below* the center (more leverage)
+CONTACT_EPS = 0.010    # aim a full 1 cm into the face
 GOAL_CLOSE_XY = 0.03   # stop if object is close in XY
 HIDE_OBJ_ORI = True    # match PushT-v1 GT demo
 
@@ -66,16 +66,36 @@ def _goal_pos(planning_obs):
     return gp[:3].copy()
 
 
-def make_delta_action(action_space, delta_xyz: np.ndarray) -> np.ndarray:
+def make_delta_action(wrapper: ManiSkillPlanningWrapper, delta_xyz: np.ndarray) -> np.ndarray:
     """
     pd_ee_delta_pose: first 3 dims are delta position.
-    We keep rotations/gripper as 0.
-    This matches your current demo pattern of filling action_flat[:3]. :contentReference[oaicite:2]{index=2}
+    The controller normalizes actions, so we need to convert raw delta (in meters)
+    to the normalized action space [-1, 1].
+    
+    Formula: normalized = (delta - 0.5*(high+low)) / (0.5*(high-low))
+    For bounds [-0.1, 0.1]: normalized = delta / 0.1
     """
-    sample = action_space.sample()
+    # Get controller bounds from wrapper
+    low, high = wrapper.get_controller_bounds()
+    
+    sample = wrapper.action_space.sample()
     action = np.zeros_like(sample, dtype=np.float32)
     flat = action.reshape(-1)
-    flat[:3] = delta_xyz.astype(np.float32)
+    
+    # Convert delta from meters to normalized action space
+    # Inverse of clip_and_scale_action: normalized = (delta - center) / half_range
+    center = 0.5 * (high + low)
+    half_range = 0.5 * (high - low)
+    if half_range < 1e-6:
+        # Avoid division by zero
+        normalized_delta = np.zeros_like(delta_xyz, dtype=np.float32)
+    else:
+        normalized_delta = (delta_xyz - center) / half_range
+    
+    # Clip to [-1, 1] to respect action space bounds
+    normalized_delta = np.clip(normalized_delta, -1.0, 1.0)
+    
+    flat[:3] = normalized_delta.astype(np.float32)
     return action
 
 
@@ -146,24 +166,29 @@ def touch_and_push_policy(wrapper: ManiSkillPlanningWrapper, obs: Dict[str, Any]
         delta = move_towards(tcp, target, STEP_SIZE)
         if np.linalg.norm(target - tcp) < 0.01:
             ctx["phase"] = 2
-        return make_delta_action(wrapper.action_space, delta)
+        return make_delta_action(wrapper, delta)
 
-    # Phase 2: descend vertically to push height at pre-contact XY (no forward motion yet)
+    # Phase 2: go down to push height at the *contact* XY
     if ctx["phase"] == 2:
-        target = np.array([pre_xy[0], pre_xy[1], z_push], dtype=np.float32)
+        target = np.array([contact_xy[0], contact_xy[1], z_push], dtype=np.float32)
         delta = move_towards(tcp, target, STEP_SIZE)
         if np.linalg.norm(target - tcp) < 0.008:
             ctx["phase"] = 3
-        return make_delta_action(wrapper.action_space, delta)
+        return make_delta_action(wrapper, delta)
 
     # Phase 3: push forward in XY while holding Z
     if ctx["phase"] == 3:
         ctx["push_steps"] += 1
 
+        # first few steps: slightly more aggressive to ensure contact
+        fwd = STEP_SIZE
+        if ctx["push_steps"] < 5:
+            fwd = STEP_SIZE * 1.5
+
         # move forward along push direction, keep z near push height
         target = np.array(
-            [tcp[0] + push_dir_xy[0] * STEP_SIZE,
-             tcp[1] + push_dir_xy[1] * STEP_SIZE,
+            [tcp[0] + push_dir_xy[0] * fwd,
+             tcp[1] + push_dir_xy[1] * fwd,
              z_push],
             dtype=np.float32
         )
@@ -172,10 +197,10 @@ def touch_and_push_policy(wrapper: ManiSkillPlanningWrapper, obs: Dict[str, Any]
         # stop pushing after some steps or if goal is close
         if ctx["push_steps"] > 350 or np.linalg.norm((obj - goal)[:2]) < GOAL_CLOSE_XY:
             ctx["phase"] = 4
-        return make_delta_action(wrapper.action_space, delta)
+        return make_delta_action(wrapper, delta)
 
     # Phase 4: done — hold still
-    return make_delta_action(wrapper.action_space, np.zeros(3, dtype=np.float32))
+    return make_delta_action(wrapper, np.zeros(3, dtype=np.float32))
 
 
 def main():
@@ -203,9 +228,16 @@ def main():
         obj_pose = np.asarray(extra["obj_pose"])
         goal_pos = np.asarray(extra["goal_pos"])
         
+        # Debug prints: check TCP-obj distance to verify contact
+        planning_obs = w.get_planning_obs(obs)
+        tcp = _tcp_pos(planning_obs)
+        obj = _obj_pos(planning_obs)
+        dist_xy = np.linalg.norm((tcp - obj)[:2])
+        dz = tcp[2] - obj[2]
+        
         if t % 20 == 0:
             print(f"[t={t}] obj_pos={obj_pose[:3]} goal_pos={goal_pos[:3]} "
-                  f"phase={ctx.get('phase')}")
+                  f"phase={ctx.get('phase')} dist_xy={dist_xy:.4f} dz={dz:.4f}")
 
         try:
             w.render()
