@@ -134,6 +134,8 @@ import torch
 
 from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.utils.registration import register_env
+from mani_skill.sensors.camera import CameraConfig
+from mani_skill.utils import sapien_utils
 import sapien.core as sapien
 import sapien.physx as physx
 import sapien.render
@@ -174,7 +176,7 @@ def compute_shelf_success(extra: Dict[str, Any]) -> bool:
     return bool(pulled_out and lifted)
 
 
-@register_env("ObjectRetrieveFromShelf-v1", max_episode_steps=200)
+@register_env("ObjectRetrieveFromShelf-v1", max_episode_steps=2000)
 class ObjectRetrieveFromShelfEnv(BaseEnv):
     """
     Minimal shelf-retrieval task for planning + RL.
@@ -200,26 +202,45 @@ class ObjectRetrieveFromShelfEnv(BaseEnv):
     SUPPORTED_ROBOTS = ["panda", "fetch"]
     SUPPORTED_REWARD_MODES = ["sparse", "none"]
 
+    @property
+    def _default_human_render_camera_configs(self):
+        """Configure camera for good view of shelf interior and robot interaction."""
+        # Camera positioned to see inside the shelf and robot interaction
+        # Robot is at x=-0.1, z=0.6; Shelf center is at x=0.45, z=0.8
+        # Shelf is open-fronted (facing -x direction), so position camera to look into it
+        shelf_center = self.shelf_builder.bay_center_xyz
+        # Camera eye: rotated much more to get a better view deep inside the shelf
+        # Position much further to the side for maximum rotation and interior visibility
+        eye_pos = [-0.75, -1.1, 1.05]  # x slightly forward, y much more to the side (maximum rotation), z elevated
+        # Target: very deep inside the shelf, at the back wall to see all layers clearly
+        target_pos = [shelf_center[0] + 0.15, shelf_center[1], shelf_center[2]]  # Very deep inside shelf, at the back wall
+        pose = sapien_utils.look_at(eye_pos, target_pos)
+        return [CameraConfig("render_camera", pose, 1024, 1024, 1.5, 0.01, 100)]
+
     def __init__(
         self,
         *args,
         robot_uids: str | Tuple[str, ...] = "panda",
         spawn_mode: str = "random_small",
+        num_objects: int = 16,  # Number of objects to spawn in shelf
+        target_object_id: int = 0,  # ID of the object that needs to be retrieved
         **kwargs,
     ) -> None:
         # Initialize shelf builder BEFORE super().__init__() because
         # super().__init__() triggers reset() which calls _load_scene()
-        # Scene / geometry builder for static shelf + table
-        self.shelf_builder = ShelfSceneBuilder()
+        # Scene / geometry builder for static shelf + table (single layer)
+        self.shelf_builder = ShelfSceneBuilder(num_layers=1, layer_spacing=0.15)
 
-        # Handle to the dynamic object (will be created or reused later)
-        self.obj: Any | None = None
+        # Handle to the dynamic objects (will be created or reused later)
+        self.objects: list[Any] = []  # List of all objects
+        self.target_object_id = target_object_id  # Which object to retrieve
 
         # Cube geometry - must be set before super().__init__() triggers _load_scene()
         self.cube_half_size = np.array([0.03, 0.03, 0.03], dtype=np.float32)
 
         # Spawn behavior
         self.spawn_mode = spawn_mode  # "fixed" (Phase A) or "random_small" (Phase B)
+        self.num_objects = num_objects
 
         # Will be filled after robot is built in _load_scene
         self._default_qpos = None
@@ -261,109 +282,208 @@ class ObjectRetrieveFromShelfEnv(BaseEnv):
         for sub_scene in self.scene.sub_scenes:
             self.shelf_builder.build(sub_scene)
 
-        # Create materials using the new API
+        # Create materials for objects with different colors
         pm = physx.PhysxMaterial(static_friction=0.5, dynamic_friction=0.5, restitution=0.01)
-        vm = sapien.render.RenderMaterial(
-            base_color=[0.9, 0.3, 0.3, 1.0],
-            metallic=0.0,
-            roughness=0.4,
-        )
+        
+        # Create multiple objects with different colors (16 colors for 16 objects)
+        self.objects = []
+        colors = [
+            [0.9, 0.3, 0.3, 1.0],  # Red
+            [0.3, 0.9, 0.3, 1.0],  # Green
+            [0.3, 0.3, 0.9, 1.0],  # Blue
+            [0.9, 0.9, 0.3, 1.0],  # Yellow
+            [0.9, 0.3, 0.9, 1.0],  # Magenta
+            [0.3, 0.9, 0.9, 1.0],  # Cyan
+            [0.9, 0.6, 0.3, 1.0],  # Orange
+            [0.6, 0.3, 0.9, 1.0],  # Purple
+            [0.5, 0.8, 0.2, 1.0],  # Lime
+            [0.2, 0.5, 0.8, 1.0],  # Sky Blue
+            [0.8, 0.2, 0.5, 1.0],  # Pink
+            [0.7, 0.7, 0.2, 1.0],  # Olive
+            [0.2, 0.7, 0.7, 1.0],  # Teal
+            [0.7, 0.2, 0.7, 1.0],  # Dark Magenta
+            [0.4, 0.6, 0.9, 1.0],  # Light Blue
+            [0.9, 0.4, 0.6, 1.0],  # Salmon
+        ]
 
-        builder = scene.create_actor_builder()
-        builder.add_box_collision(half_size=self.cube_half_size, material=pm)
-        builder.add_box_visual(half_size=self.cube_half_size, material=vm)
+        for i in range(self.num_objects):
+            color = colors[i % len(colors)]
+            vm = sapien.render.RenderMaterial(
+                base_color=color,
+                metallic=0.0,
+                roughness=0.4,
+            )
 
-        bay_center = self.shelf_builder.bay_center_xyz
-        initial_pos = bay_center.copy()
-        initial_pos[2] += self.cube_half_size[2]
+            builder = scene.create_actor_builder()
+            builder.add_box_collision(half_size=self.cube_half_size, material=pm)
+            builder.add_box_visual(half_size=self.cube_half_size, material=vm)
 
-        builder.initial_pose = sapien.Pose(initial_pos, [1, 0, 0, 0])
-        self.obj = builder.build(name="shelf_object")
+            # Initial pose will be set in _initialize_episode
+            builder.initial_pose = sapien.Pose([0, 0, -1], [1, 0, 0, 0])
+            obj = builder.build(name=f"shelf_object_{i}")
+            self.objects.append(obj)
+        
         # NOTE:
         # - Dynamic object spawning will happen in _initialize_episode.
         # - Robot is constructed by BaseEnv (via super()._load_scene).
+    
+    def _load_agent(self, options: Dict[str, Any]) -> None:
+        """Load agent with initial pose positioned to reach the shelf."""
+        # Position panda robot base higher and further back to reach shelf layers
+        # Shelf layers are at z=0.65, 0.8, 0.95 (bottom to top)
+        # Position robot base at table level (z=0.6) to reach upward
+        # Shelf center is at x=0.45, so position robot base at x=-0.1 (further back)
+        # Orientation: quaternion [1, 0, 0, 0] = identity (facing +x forward, which is correct for shelf at x=0.45)
+        initial_pose = sapien.Pose(p=[-0.1, 0.0, 0.6], q=[1, 0, 0, 0])
+        super()._load_agent(options, initial_agent_poses=initial_pose)
+    
     def _reset_robot_pose(self) -> None:
-        """Reset robot to a consistent start configuration."""
-        if self._default_qpos is None:
-            # Fallback: let BaseEnv / agent handle it
-            try:
-                self.agent.reset()
-            except Exception:
-                pass
-            return
-
+        """Reset robot to a consistent start configuration for reaching upward to shelf layers."""
         try:
             robot = self.agent.robot
-            qpos = self._default_qpos.copy()
+            # Custom qpos for reaching upward to shelf layers
+            # Shelf layers are at z=0.65, 0.8, 0.95 (bottom to top)
+            # Robot base is at z=0.6, so need to reach upward
+            # Joint configuration: arm extended forward and upward
+            # Panda has 7 arm joints + 2 gripper joints = 9 total
+            # Shelf is at x=0.45, robot at x=-0.1, so need to reach forward (+x direction)
+            reach_qpos = np.array([
+                0.0,           # joint1: base rotation (0 = forward, facing +x toward shelf)
+                0.6,           # joint2: shoulder lift (upward, adjusted for better reach)
+                0.0,           # joint3: shoulder rotation (0 = forward)
+                -0.8,          # joint4: elbow bend (extended forward and up)
+                0.0,           # joint5: wrist rotation
+                1.0,           # joint6: wrist pitch (angled upward, less extreme)
+                0.0,           # joint7: wrist roll (0 = neutral, better for grasping)
+                0.04,          # gripper1: slightly open
+                0.04,          # gripper2: slightly open
+            ], dtype=np.float32)
+            
+            # Use custom reach configuration
+            qpos = reach_qpos
             qvel = np.zeros_like(qpos)
             robot.set_qpos(qpos)
             robot.set_qvel(qvel)
         except Exception:
-            # If something goes wrong, we don't want the env to crash
-            pass
-    def _spawn_object_fixed(self) -> None:
+            # If something goes wrong, fallback to agent reset
+            try:
+                self.agent.reset()
+            except Exception:
+                pass
+    def _spawn_objects_fixed(self) -> None:
         """
         Phase A: fixed spawn.
-        Place the cube at a known safe pose in the center of the bay.
+        Place objects in a grid pattern across shelf layers.
+        For 16 objects across 3 layers: 6, 5, 5 distribution.
         """
-        if self.obj is None:
+        if not self.objects:
             return
 
-        bay_min = self.shelf_builder.bay_min_xyz
-        bay_max = self.shelf_builder.bay_max_xyz
-        bay_center = 0.5 * (bay_min + bay_max)
+        bay_geometries = self.shelf_builder.bay_geometries
+        num_layers = len(bay_geometries)
+        
+        # Distribute objects across layers more evenly
+        # For 16 objects: 6, 5, 5 or 5, 6, 5
+        objects_per_layer = []
+        remaining = self.num_objects
+        for i in range(num_layers):
+            if i == num_layers - 1:
+                objects_per_layer.append(remaining)
+            else:
+                count = (remaining + num_layers - i - 1) // (num_layers - i)  # Distribute evenly
+                objects_per_layer.append(count)
+                remaining -= count
+        
+        obj_idx = 0
+        for layer_idx, bay_geom in enumerate(bay_geometries):
+            if obj_idx >= len(self.objects):
+                break
+            
+            num_in_layer = objects_per_layer[layer_idx] if layer_idx < len(objects_per_layer) else 0
+            if num_in_layer == 0:
+                continue
+            
+            bay_min = bay_geom.bay_min_xyz
+            bay_max = bay_geom.bay_max_xyz
+            bay_center = bay_geom.bay_center
+            
+            # Create a grid pattern within this layer
+            grid_size = int(np.ceil(np.sqrt(num_in_layer)))
+            mx = float(self.cube_half_size[0] + 0.01)
+            my = float(self.cube_half_size[1] + 0.01)
+            
+            x_range = (bay_max[0] - mx) - (bay_min[0] + mx)
+            y_range = (bay_max[1] - my) - (bay_min[1] + my)
+            
+            floor_z = bay_min[2]
+            z_center = floor_z + self.cube_half_size[2] + 1e-3
+            
+            placed_in_layer = 0
+            for i in range(grid_size):
+                for j in range(grid_size):
+                    if obj_idx >= len(self.objects) or placed_in_layer >= num_in_layer:
+                        break
+                    
+                    if grid_size > 1:
+                        x = bay_min[0] + mx + (i / (grid_size - 1)) * x_range
+                        y = bay_min[1] + my + (j / (grid_size - 1)) * y_range
+                    else:
+                        x = bay_center[0]
+                        y = bay_center[1]
+                    
+                    pos = np.array([x, y, z_center], dtype=np.float32)
+                    quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+                    self.objects[obj_idx].set_pose(sapien.Pose(pos, quat))
+                    obj_idx += 1
+                    placed_in_layer += 1
 
-        pos = bay_center.copy()
-        # Put cube resting on the bay floor:
-        # floor z = bay_min_z
-        # cube center z = floor_z + half_height + small epsilon
-        floor_z = bay_min[2]
-        pos[2] = floor_z + self.cube_half_size[2] + 1e-3
-
-        quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-        self.obj.set_pose(sapien.Pose(pos, quat))
-
-    def _spawn_object_random_small(self) -> None:
+    def _spawn_objects_random_small(self) -> None:
         """
         Phase B: small randomization.
-        Randomize x/y within bay bounds with a margin from walls.
-        Keep z = floor + half cube size.
+        Randomize positions within bay bounds across all layers.
         """
-        if self.obj is None:
+        if not self.objects:
             return
 
-        bay_min = self.shelf_builder.bay_min_xyz
-        bay_max = self.shelf_builder.bay_max_xyz
-
+        bay_geometries = self.shelf_builder.bay_geometries
+        num_layers = len(bay_geometries)
+        
         # Margins in x/y to avoid intersecting walls
-        # (must be >= cube_half_size + a tiny epsilon)
         mx = float(self.cube_half_size[0] + 0.01)
         my = float(self.cube_half_size[1] + 0.01)
-
-        # Keep z exactly as in fixed spawn
-        floor_z = bay_min[2]
-        z_center = floor_z + self.cube_half_size[2] + 1e-3
-
-        # Allowed range inside bay for cube CENTER
-        x_min = bay_min[0] + mx
-        x_max = bay_max[0] - mx
-        y_min = bay_min[1] + my
-        y_max = bay_max[1] - my
-
-        # Safety: if margins over-shrink, clamp so min <= max
-        if x_min > x_max:
-            mid = 0.5 * (bay_min[0] + bay_max[0])
-            x_min = x_max = mid
-        if y_min > y_max:
-            mid = 0.5 * (bay_min[1] + bay_max[1])
-            y_min = y_max = mid
-
-        x = np.random.uniform(x_min, x_max)
-        y = np.random.uniform(y_min, y_max)
-        pos = np.array([x, y, z_center], dtype=np.float32)
-
-        quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-        self.obj.set_pose(sapien.Pose(pos, quat))
+        
+        # Distribute objects across layers
+        for obj_idx, obj in enumerate(self.objects):
+            # Select a random layer
+            layer_idx = np.random.randint(0, num_layers)
+            bay_geom = bay_geometries[layer_idx]
+            
+            bay_min = bay_geom.bay_min_xyz
+            bay_max = bay_geom.bay_max_xyz
+            
+            # Randomize x/y within bay bounds
+            x_min = bay_min[0] + mx
+            x_max = bay_max[0] - mx
+            y_min = bay_min[1] + my
+            y_max = bay_max[1] - my
+            
+            # Safety: if margins over-shrink, clamp so min <= max
+            if x_min > x_max:
+                mid = 0.5 * (bay_min[0] + bay_max[0])
+                x_min = x_max = mid
+            if y_min > y_max:
+                mid = 0.5 * (bay_min[1] + bay_max[1])
+                y_min = y_max = mid
+            
+            x = np.random.uniform(x_min, x_max)
+            y = np.random.uniform(y_min, y_max)
+            
+            floor_z = bay_min[2]
+            z_center = floor_z + self.cube_half_size[2] + 1e-3
+            pos = np.array([x, y, z_center], dtype=np.float32)
+            
+            quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+            obj.set_pose(sapien.Pose(pos, quat))
 
     def _initialize_episode(self, env_idx: int, options: Dict[str, Any]) -> None:
         """
@@ -378,13 +498,13 @@ class ObjectRetrieveFromShelfEnv(BaseEnv):
         # 1) Reset robot to consistent configuration
         self._reset_robot_pose()
 
-        # 2) Place the cube in the bay
+        # 2) Place objects in the shelf
         if self.spawn_mode == "fixed":
-            # Phase A: deterministic pose
-            self._spawn_object_fixed()
+            # Phase A: deterministic poses
+            self._spawn_objects_fixed()
         else:
             # Default: Phase B small randomization
-            self._spawn_object_random_small()
+            self._spawn_objects_random_small()
     
     def _get_obs_extra(self, info: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -394,8 +514,10 @@ class ObjectRetrieveFromShelfEnv(BaseEnv):
           - "tcp_pose":  (7,) end-effector pose (pos + quat)
 
         In state_dict mode (and generally, for this env) also returns:
-          - "obj_pose":    (7,) object pose (pos + quat); if missing, NaNs
-          - "bay_center":  (3,) bay interior center
+          - "obj_poses":   (N, 7) all object poses (pos + quat)
+          - "target_obj_pose": (7,) target object pose
+          - "target_obj_id": (int) ID of target object
+          - "bay_center":  (3,) bay interior center (bottom layer)
           - "bay_size":    (3,) bay interior size
         """
         extra: Dict[str, Any] = {}
@@ -419,18 +541,38 @@ class ObjectRetrieveFromShelfEnv(BaseEnv):
             pass
         extra["tcp_pose"] = tcp_pose
 
-        # -------- obj_pose (state_dict / this env) --------
-        obj_pose = np.full((7,), np.nan, dtype=np.float32)
-        if self.obj is not None:
+        # -------- obj_poses: all objects (state_dict / this env) --------
+        obj_poses = []
+        for obj in self.objects:
+            obj_pose = np.full((7,), np.nan, dtype=np.float32)
+            if obj is not None:
+                try:
+                    pose = obj.get_pose()
+                    pos = np.asarray(pose.p, dtype=np.float32)
+                    quat = np.asarray(pose.q, dtype=np.float32)
+                    obj_pose[:] = np.concatenate([pos, quat], axis=0)
+                except Exception:
+                    pass
+            obj_poses.append(obj_pose)
+        
+        obj_poses_array = np.array(obj_poses, dtype=np.float32)  # (N, 7)
+        extra["obj_poses"] = obj_poses_array
+        
+        # -------- target object pose --------
+        target_obj_pose = np.full((7,), np.nan, dtype=np.float32)
+        if 0 <= self.target_object_id < len(self.objects) and self.objects[self.target_object_id] is not None:
             try:
-                pose = self.obj.get_pose()
+                pose = self.objects[self.target_object_id].get_pose()
                 pos = np.asarray(pose.p, dtype=np.float32)
                 quat = np.asarray(pose.q, dtype=np.float32)
-                obj_pose[:] = np.concatenate([pos, quat], axis=0)
+                target_obj_pose[:] = np.concatenate([pos, quat], axis=0)
             except Exception:
-                # keep NaNs, but the shape stays (7,)
                 pass
-        extra["obj_pose"] = obj_pose
+        extra["target_obj_pose"] = target_obj_pose
+        extra["target_obj_id"] = self.target_object_id
+        
+        # For backward compatibility, also include obj_pose (target object)
+        extra["obj_pose"] = target_obj_pose
 
         # -------- shelf bay geometry (static & always valid) --------
         bay_center = self.shelf_builder.bay_center_xyz.astype(np.float32)
@@ -442,7 +584,7 @@ class ObjectRetrieveFromShelfEnv(BaseEnv):
         extra["bay_size"] = bay_size      # (3,)
 
         # -------- goal_pos: target position for pulling object out of shelf --------
-        # Goal is to pull object out along +x beyond the front face of the bay
+        # Goal is to pull target object out along +x beyond the front face of the bay
         # Position: slightly beyond bay_max_x, same y as bay center, slightly above floor
         x_margin = 0.05  # 5 cm beyond front face (more than success margin for planning)
         z_margin = 0.03  # 3 cm above floor
@@ -458,34 +600,34 @@ class ObjectRetrieveFromShelfEnv(BaseEnv):
 
     def _compute_success(self) -> bool:
         """
-        Compute whether the object has been successfully retrieved from the shelf.
+        Compute whether the target object has been successfully retrieved from the shelf.
         
         Success conditions:
-        - Object is pulled out along +x beyond bay front face (x > x_max + margin)
-        - Object is lifted slightly above bay floor (z > floor_z + margin)
+        - Target object is pulled out along +x beyond bay front face (x > x_max + margin)
+        - Target object is lifted slightly above bay floor (z > floor_z + margin)
         """
-        if self.obj is None:
+        if not (0 <= self.target_object_id < len(self.objects)):
+            return False
+        
+        target_obj = self.objects[self.target_object_id]
+        if target_obj is None:
             return False
         
         try:
-            # Get current object pose
-            obj_pose = self.obj.get_pose()
+            # Get current target object pose
+            obj_pose = target_obj.get_pose()
             obj_pos = np.asarray(obj_pose.p, dtype=np.float32)
             obj_x, _, obj_z = obj_pos
             
-            # Get shelf geometry
-            bay_center = self.shelf_builder.bay_center_xyz
-            bay_size = self.shelf_builder.bay_size_xyz
+            # Get shelf geometry (use bottom layer for reference)
             bay_min = self.shelf_builder.bay_min_xyz
             bay_max = self.shelf_builder.bay_max_xyz
             
-            sx, sy, sz = bay_size
-            cx, cy, cz = bay_center
+            # Bay bounds in x (use max across all layers)
+            all_bay_max_x = [geom.bay_max_xyz[0] for geom in self.shelf_builder.bay_geometries]
+            x_max = max(all_bay_max_x)
             
-            # Bay bounds in x
-            x_max = bay_max[0]
-            
-            # Bay floor height
+            # Bay floor height (use bottom layer)
             shelf_floor_z = bay_min[2]
             
             # Margins

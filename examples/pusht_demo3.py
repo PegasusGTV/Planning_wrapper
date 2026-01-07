@@ -19,9 +19,9 @@ from planning_wrapper.adapters import PushTTaskAdapter
 
 
 # ----- Tuning knobs (aggressive enough to make real contact) -----
-MAX_STEPS = 1000
+MAX_STEPS = 200
 RENDER_SLEEP = 0.02    # ~50 FPS
-STEP_SIZE = 0.04      # slightly smaller step but more controlled
+STEP_SIZE = 0.01      # slightly smaller step but more controlled
 
 # Get closer and slightly lower so the stick actually hits the T block.
 BACKOFF = 0.010        # closer behind the tee

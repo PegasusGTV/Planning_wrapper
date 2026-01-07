@@ -95,6 +95,14 @@ class ManiSkillPlanningWrapper:
             "goal_pos": goal_pos,
             "obj_pose": obj_pose,
         }
+        
+        # Optionally include multi-object fields if they exist (for shelf retrieval)
+        if "target_obj_pose" in extra:
+            planning_obs["target_obj_pose"] = np.asarray(extra["target_obj_pose"], dtype=np.float32).copy()
+        if "obj_poses" in extra:
+            planning_obs["obj_poses"] = np.asarray(extra["obj_poses"], dtype=np.float32).copy()
+        if "target_obj_id" in extra:
+            planning_obs["target_obj_id"] = extra["target_obj_id"]
 
         return planning_obs
     
