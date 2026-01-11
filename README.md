@@ -3,6 +3,11 @@
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+<div align="center">
+  <img src="videos/pusht_example2.gif" alt="PushT Planning Demo" width="600"/>
+  <p><em>PushT Task: Robot manipulation planning with state cloning and restoration</em></p>
+</div>
+
 A Python package that provides planning-friendly wrappers and utilities for [ManiSkill3](https://github.com/haosulab/ManiSkill) environments. This package enables efficient state cloning/restoration, planning observation extraction, and task-specific adapters for manipulation planning algorithms.
 
 ## 🎯 Overview
@@ -338,6 +343,42 @@ Planning_wrapper/
 ├── pyproject.toml                   # Package configuration
 └── README.md                        # This file
 ```
+
+## 🎬 Visualizations
+
+### PushT Task Demonstrations
+
+<div align="center">
+  <table>
+    <tr>
+      <td align="center">
+        <img src="videos/pusht_example2.gif" alt="PushT Demo 2" width="400"/>
+        <br><strong>PushT Demo 2</strong>
+      </td>
+      <td align="center">
+        <img src="videos/pusht_example3.gif" alt="PushT Demo 3" width="400"/>
+        <br><strong>PushT Demo 3</strong>
+      </td>
+    </tr>
+  </table>
+</div>
+
+### Shelf Retrieval Task Demonstrations
+
+<div align="center">
+  <table>
+    <tr>
+      <td align="center">
+        <img src="videos/object_retrival_example2.gif" alt="Shelf Retrieval Demo 2" width="400"/>
+        <br><strong>Shelf Retrieval Demo 2</strong>
+      </td>
+      <td align="center">
+        <img src="videos/object_retrieval3.gif" alt="Shelf Retrieval Demo 3" width="400"/>
+        <br><strong>Shelf Retrieval Demo 3</strong>
+      </td>
+    </tr>
+  </table>
+</div>
 
 ## 🎬 Examples
 
