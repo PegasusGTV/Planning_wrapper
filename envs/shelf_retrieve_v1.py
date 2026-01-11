@@ -206,7 +206,7 @@ class ObjectRetrieveFromShelfEnv(BaseEnv):
     def _default_human_render_camera_configs(self):
         """Configure camera for good view of shelf interior and robot interaction."""
         # Camera positioned to see inside the shelf and robot interaction
-        # Robot is at x=-0.1, z=0.6; Shelf center is at x=0.45, z=0.8
+        # Robot is at x=-0.3, z=0.5; Shelf center is at x=0.45, z=0.8
         # Shelf is open-fronted (facing -x direction), so position camera to look into it
         shelf_center = self.shelf_builder.bay_center_xyz
         # Camera eye: rotated much more to get a better view deep inside the shelf
@@ -224,12 +224,25 @@ class ObjectRetrieveFromShelfEnv(BaseEnv):
         spawn_mode: str = "random_small",
         num_objects: int = 16,  # Number of objects to spawn in shelf
         target_object_id: int = 0,  # ID of the object that needs to be retrieved
+        # Shelf geometry parameters - can be customized for larger shelf
+        bay_center: Tuple[float, float, float] = (0.45, 0.0, 0.8),
+        bay_size: Tuple[float, float, float] = (0.3, 0.4, 0.3),
+        table_center: Tuple[float, float, float] = (0.45, 0.0, 0.6),
+        table_size: Tuple[float, float, float] = (0.8, 0.8, 0.05),
         **kwargs,
     ) -> None:
         # Initialize shelf builder BEFORE super().__init__() because
         # super().__init__() triggers reset() which calls _load_scene()
         # Scene / geometry builder for static shelf + table (single layer)
-        self.shelf_builder = ShelfSceneBuilder(num_layers=1, layer_spacing=0.15)
+        # Allow custom shelf dimensions for larger workspace
+        self.shelf_builder = ShelfSceneBuilder(
+            num_layers=1,
+            layer_spacing=0.15,
+            bay_center=bay_center,
+            bay_size=bay_size,
+            table_center=table_center,
+            table_size=table_size,
+        )
 
         # Handle to the dynamic objects (will be created or reused later)
         self.objects: list[Any] = []  # List of all objects
@@ -283,7 +296,8 @@ class ObjectRetrieveFromShelfEnv(BaseEnv):
             self.shelf_builder.build(sub_scene)
 
         # Create materials for objects with different colors
-        pm = physx.PhysxMaterial(static_friction=0.5, dynamic_friction=0.5, restitution=0.01)
+        # Very low friction to make objects much easier to move
+        pm = physx.PhysxMaterial(static_friction=0.1, dynamic_friction=0.1, restitution=0.2)
         
         # Create multiple objects with different colors (16 colors for 16 objects)
         self.objects = []
@@ -315,12 +329,33 @@ class ObjectRetrieveFromShelfEnv(BaseEnv):
             )
 
             builder = scene.create_actor_builder()
-            builder.add_box_collision(half_size=self.cube_half_size, material=pm)
+            # Use very low density (50 kg/m³) to make objects very light and easy to move
+            builder.add_box_collision(half_size=self.cube_half_size, material=pm, density=50)
             builder.add_box_visual(half_size=self.cube_half_size, material=vm)
 
             # Initial pose will be set in _initialize_episode
             builder.initial_pose = sapien.Pose([0, 0, -1], [1, 0, 0, 0])
+            # Build as dynamic (default behavior of build() is dynamic)
+            # This matches the pattern used in ManiSkill examples like PushCube
             obj = builder.build(name=f"shelf_object_{i}")
+            
+            # Set mass directly to ensure objects are very light (0.01 kg = 10 grams)
+            # This makes them much easier to push with the manipulator
+            try:
+                # Try setting mass directly on the Actor (ManiSkill wrapper)
+                if hasattr(obj, 'mass'):
+                    obj.mass = 0.01  # 10 grams - very light
+                else:
+                    # Fallback: access through entities
+                    for entity in obj._objs:
+                        if hasattr(entity, 'find_component_by_type'):
+                            rigid_body = entity.find_component_by_type(physx.PhysxRigidDynamicComponent)
+                            if rigid_body is not None and hasattr(rigid_body, 'mass'):
+                                rigid_body.mass = 0.01  # 10 grams - very light
+            except Exception:
+                # If setting mass fails, continue - density=50 should still make objects light
+                pass
+            
             self.objects.append(obj)
         
         # NOTE:
@@ -329,32 +364,36 @@ class ObjectRetrieveFromShelfEnv(BaseEnv):
     
     def _load_agent(self, options: Dict[str, Any]) -> None:
         """Load agent with initial pose positioned to reach the shelf."""
-        # Position panda robot base higher and further back to reach shelf layers
+        # Position panda robot base at optimal height to reach shelf without entering
         # Shelf layers are at z=0.65, 0.8, 0.95 (bottom to top)
-        # Position robot base at table level (z=0.6) to reach upward
-        # Shelf center is at x=0.45, so position robot base at x=-0.1 (further back)
-        # Orientation: quaternion [1, 0, 0, 0] = identity (facing +x forward, which is correct for shelf at x=0.45)
-        initial_pose = sapien.Pose(p=[-0.1, 0.0, 0.6], q=[1, 0, 0, 0])
+        # Position robot base at z=0.5 (table level) to reach objects horizontally
+        # Get shelf center from builder to position robot appropriately
+        shelf_center_x = float(self.shelf_builder.bay_center[0])
+        # Position robot base further back from shelf center to allow good reach
+        robot_x = shelf_center_x - 0.75  # 75cm back from shelf center (more space for larger shelves)
+        # Orientation: identity quaternion [1, 0, 0, 0] (facing +x toward the shelf)
+        # This keeps the manipulator outside the shelf while allowing good reach
+        initial_pose = sapien.Pose(p=[robot_x, 0.0, 0.5], q=[1, 0, 0, 0])
         super()._load_agent(options, initial_agent_poses=initial_pose)
     
     def _reset_robot_pose(self) -> None:
-        """Reset robot to a consistent start configuration for reaching upward to shelf layers."""
+        """Reset robot to a consistent start configuration for reaching shelf without entering."""
         try:
             robot = self.agent.robot
-            # Custom qpos for reaching upward to shelf layers
+            # Custom qpos for reaching shelf objects while staying outside
             # Shelf layers are at z=0.65, 0.8, 0.95 (bottom to top)
-            # Robot base is at z=0.6, so need to reach upward
-            # Joint configuration: arm extended forward and upward
+            # Robot base is at z=0.5, x=-0.3, so need to reach forward and slightly up
+            # Joint configuration: arm extended forward horizontally, keeping TCP outside shelf
             # Panda has 7 arm joints + 2 gripper joints = 9 total
-            # Shelf is at x=0.45, robot at x=-0.1, so need to reach forward (+x direction)
+            # Shelf is at x=0.45, robot at x=-0.3, so need to reach forward (+x direction)
             reach_qpos = np.array([
                 0.0,           # joint1: base rotation (0 = forward, facing +x toward shelf)
-                0.6,           # joint2: shoulder lift (upward, adjusted for better reach)
+                0.3,           # joint2: shoulder lift (slightly up, but mostly horizontal)
                 0.0,           # joint3: shoulder rotation (0 = forward)
-                -0.8,          # joint4: elbow bend (extended forward and up)
+                -1.2,          # joint4: elbow bend (more extended for horizontal reach)
                 0.0,           # joint5: wrist rotation
-                1.0,           # joint6: wrist pitch (angled upward, less extreme)
-                0.0,           # joint7: wrist roll (0 = neutral, better for grasping)
+                0.5,           # joint6: wrist pitch (more horizontal, pointing forward)
+                0.0,           # joint7: wrist roll (0 = neutral)
                 0.04,          # gripper1: slightly open
                 0.04,          # gripper2: slightly open
             ], dtype=np.float32)

@@ -1,0 +1,53 @@
+# Planning Wrapper Requirements
+# For Linux setup - install with: pip install -r requirements.txt
+
+# Core dependencies
+numpy>=1.22.0,<2.0.0
+gymnasium>=0.29.0
+
+# ManiSkill3 dependencies
+# Note: ManiSkill3 itself should be installed via:
+# pip install git+https://github.com/haosulab/ManiSkill.git
+# The following are dependencies that ManiSkill3 requires:
+
+# Core ManiSkill dependencies
+scipy
+dacite
+h5py
+pyyaml
+tqdm
+GitPython
+tabulate
+transforms3d
+trimesh
+imageio
+imageio[ffmpeg]
+IPython
+pytorch_kinematics==0.7.6
+nvidia-ml-py
+tyro>=0.8.5
+huggingface_hub
+
+# Linux-specific dependencies (installed automatically with ManiSkill3 on Linux)
+# mplib==0.1.1  # Linux only
+# fast_kinematics==0.2.2  # Linux only
+# sapien>=3.0.0  # Linux only, installed automatically with mani_skill
+
+# Pinocchio (required for kinematics)
+# Install via conda: conda install -c conda-forge pinocchio
+# Or via pip if available: pinocchio
+
+# PyTorch (install separately based on your CUDA version)
+# For CUDA 11.8: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+# For CUDA 12.1: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# For CPU only: pip install torch torchvision torchaudio
+# torch
+# torchvision
+# torchaudio
+
+# Development dependencies (optional)
+# pytest>=7.0.0
+# black>=23.0.0
+# isort>=5.12.0
+# mypy>=1.0.0
+

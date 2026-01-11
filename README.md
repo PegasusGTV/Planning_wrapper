@@ -34,25 +34,131 @@ Planning Wrapper bridges the gap between ManiSkill3 environments and planning al
 
 ### Prerequisites
 
-- Python >= 3.9
+- Python >= 3.9 (3.11 recommended)
+- Git (for installing ManiSkill3)
 - [ManiSkill3](https://github.com/haosulab/ManiSkill) installed and configured
 
-### Install from Source
+### Linux Installation
+
+#### Step 1: Clone the Repository
 
 ```bash
 git clone https://github.com/PegasusGTV/Planning_wrapper.git
 cd Planning_wrapper
+```
+
+#### Step 2: Create a Virtual Environment (Recommended)
+
+Using conda (recommended):
+```bash
+conda create -n planning_wrapper python=3.11 -y
+conda activate planning_wrapper
+```
+
+Or using venv:
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
+
+#### Step 3: Install System Dependencies (Linux)
+
+Install Pinocchio via conda (recommended):
+```bash
+conda install -c conda-forge pinocchio -y
+```
+
+Or install system packages if using system Python:
+```bash
+# Ubuntu/Debian
+sudo apt-get update
+sudo apt-get install -y libpinocchio-dev
+
+# Fedora/CentOS
+sudo dnf install -y pinocchio-devel
+```
+
+#### Step 4: Install Python Dependencies
+
+Upgrade pip first:
+```bash
+pip install --upgrade pip
+```
+
+Install project dependencies:
+```bash
+pip install -r requirements.txt
+```
+
+#### Step 5: Install ManiSkill3
+
+```bash
+pip install git+https://github.com/haosulab/ManiSkill.git
+```
+
+This may take several minutes as it downloads and installs many dependencies.
+
+#### Step 6: Install PyTorch
+
+Install PyTorch based on your CUDA version (if you have a GPU):
+
+**For CUDA 11.8:**
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+```
+
+**For CUDA 12.1:**
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+```
+
+**For CPU only:**
+```bash
+pip install torch torchvision torchaudio
+```
+
+#### Step 7: Install Planning Wrapper
+
+```bash
 pip install -e .
 ```
+
+#### Step 8: Verify Installation
+
+Test that everything is installed correctly:
+```bash
+python -c "import planning_wrapper; print('✅ planning_wrapper installed!')"
+python -c "import mani_skill; print('✅ ManiSkill3 installed!')"
+python -c "import pinocchio; print('✅ pinocchio installed!')"
+python -c "import torch; print('✅ PyTorch version:', torch.__version__)"
+```
+
+### Windows Installation
+
+For Windows users, we provide a detailed step-by-step guide. Please follow the instructions in **[WINDOWS_SETUP.md](WINDOWS_SETUP.md)** for complete Windows installation instructions.
+
+**Quick Windows Setup Summary:**
+
+1. Install Python 3.9+ and Miniconda
+2. Install Git and Visual C++ Redistributables
+3. Create conda environment: `conda create -n planning_wrapper python=3.11 -y`
+4. Install dependencies: `pip install -r requirements.txt`
+5. Install ManiSkill3: `pip install git+https://github.com/haosulab/ManiSkill.git`
+6. Install Pinocchio: `conda install -c conda-forge pinocchio -y`
+7. Install PyTorch (CPU version recommended for Windows): `pip install torch==2.3.0 --index-url https://download.pytorch.org/whl/cpu`
+8. Install Planning Wrapper: `pip install -e .`
+
+For detailed Windows instructions, troubleshooting, and platform-specific notes, see **[WINDOWS_SETUP.md](WINDOWS_SETUP.md)**.
 
 ### Install Dependencies
 
 The package requires:
-- `numpy>=1.22.0`
+- `numpy>=1.22.0,<2.0.0` (NumPy 2.x is not yet fully supported)
 - `gymnasium>=0.29.0`
 - `mani_skill` (ManiSkill3)
+- `pinocchio` (for kinematics, install via conda on both Linux and Windows)
 
-These are automatically installed when installing the package.
+See `requirements.txt` for a complete list of dependencies.
 
 ## 🚀 Quick Start
 
@@ -341,6 +447,8 @@ Planning_wrapper/
 │   └── test_replay_shelf.py         # Tests for shelf state cloning
 ├── videos/                          # Demo videos and GIFs
 ├── pyproject.toml                   # Package configuration
+├── requirements.txt                 # Python dependencies for Linux setup
+├── WINDOWS_SETUP.md                 # Detailed Windows installation guide
 └── README.md                        # This file
 ```
 
@@ -443,12 +551,17 @@ pytest tests/test_replay_shelf.py
 
 ## 🔧 Requirements
 
-- Python >= 3.9
-- `numpy>=1.22.0`
+- Python >= 3.9 (3.11 recommended)
+- `numpy>=1.22.0,<2.0.0` (NumPy 2.x is not yet fully supported)
 - `gymnasium>=0.29.0`
 - `mani_skill` (ManiSkill3)
+- `pinocchio` (for kinematics, install via conda: `conda install -c conda-forge pinocchio`)
 
-See `pyproject.toml` for complete dependency information.
+**For Linux:** See `requirements.txt` for a complete list of dependencies that can be installed via pip.
+
+**For Windows:** See `WINDOWS_SETUP.md` for detailed Windows-specific installation instructions.
+
+See `pyproject.toml` for package metadata and optional development dependencies.
 
 ## 🤝 Contributing
 

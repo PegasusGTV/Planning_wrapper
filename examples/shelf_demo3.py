@@ -8,7 +8,7 @@ This demo:
 - Uses improved camera angle for better visualization
 """
 
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
 
 import numpy as np
 
@@ -23,33 +23,70 @@ from planning_wrapper.wrappers.maniskill_planning import ManiSkillPlanningWrappe
 from planning_wrapper.adapters.shelf_retrieve import ShelfRetrieveTaskAdapter
 
 
-MAX_STEPS = 500
-APPROACH_STEP_SIZE = 0.02  # meters per step when approaching object
-PULL_STEP_SIZE = 0.015  # meters per step when pulling object
-APPROACH_DIST = 0.08  # distance to maintain from object
+MAX_STEPS = 1500  # Increased time for object manipulation
+# Following pusht_demo3.py pattern: smaller steps but properly normalized
+STEP_SIZE = 0.008  # meters per step (increased for more forceful pushing)
+BACKOFF = 0.02  # position behind object from robot's side (left side)
+ABOVE_Z = 0.05  # approach height above object
+PUSH_Z_OFFSET = -0.005  # push slightly below center for better leverage
+CONTACT_EPS = 0.008  # contact distance - get close to object surface
+GOAL_CLOSE_XY = 0.05  # stop if object is close to goal in XY
 
 
-def multi_object_retrieve_policy(
+def make_delta_action(wrapper: ManiSkillPlanningWrapper, delta_xyz: np.ndarray) -> np.ndarray:
+    """
+    Convert a delta (meters) into the controller's normalized action space.
+    Exact copy from pusht_demo3.py to ensure proper scaling.
+    """
+    low, high = wrapper.get_controller_bounds()
+    sample = wrapper.action_space.sample()
+    action = np.zeros_like(sample, dtype=np.float32)
+    flat = action.reshape(-1)
+    
+    # Convert delta from meters to normalized action space
+    center = 0.5 * (high + low)
+    half_range = 0.5 * (high - low)
+    if half_range < 1e-6:
+        normalized_delta = np.zeros_like(delta_xyz, dtype=np.float32)
+    else:
+        normalized_delta = (delta_xyz - center) / half_range
+    
+    # Clip to [-1, 1] to respect action space bounds
+    normalized_delta = np.clip(normalized_delta, -1.0, 1.0)
+    
+    flat[:3] = normalized_delta.astype(np.float32)
+    return action
+
+
+def move_towards(curr: np.ndarray, target: np.ndarray, max_step: float) -> np.ndarray:
+    """Move towards target with max step size. From pusht_demo3.py"""
+    d = target - curr
+    dist = float(np.linalg.norm(d))
+    if dist < 1e-6:
+        return np.zeros(3, dtype=np.float32)
+    step = min(max_step, dist)
+    return (d / dist * step).astype(np.float32)
+
+
+def touch_and_push_policy(
     wrapper: ManiSkillPlanningWrapper, 
     obs,
-    phase: str = "approach",
+    ctx: dict,
     target_obj_id: int = 0,
-) -> Tuple[np.ndarray, str]:
+) -> np.ndarray:
     """
-    Policy for retrieving a specific target object from multiple objects.
-    
-    Phases:
-    1. "approach": Move TCP close to target object
-    2. "pull": Pull target object toward goal (outside shelf)
-    
-    Returns: (action, next_phase)
+    Policy following pusht_demo3.py pattern:
+      0) compute push direction, pre-contact point
+      1) go above pre-contact
+      2) descend to push height
+      3) push forward toward goal (keeping height) in a straight line
     """
     planning_obs = wrapper.get_planning_obs(obs)
     
-    # Extract target object pose - try multiple sources
+    # Extract target object pose
     target_obj_pose = None
     if "target_obj_pose" in planning_obs:
-        target_obj_pose = np.asarray(planning_obs["target_obj_pose"]).reshape(-1, 7)[0]  # (7,)
+        target_obj_pose = np.asarray(planning_obs["target_obj_pose"]).reshape(-1, 7)[0]
     elif "obj_poses" in planning_obs:
         obj_poses = np.asarray(planning_obs["obj_poses"])
         if len(obj_poses) > target_obj_id:
@@ -58,111 +95,139 @@ def multi_object_retrieve_policy(
             target_obj_pose = obj_poses[0]
         else:
             target_obj_pose = np.full((7,), np.nan, dtype=np.float32)
-    elif "obj_pose" in planning_obs:
-        # Fallback to single obj_pose
-        target_obj_pose = np.asarray(planning_obs["obj_pose"]).reshape(-1, 7)[0]
     else:
         target_obj_pose = np.full((7,), np.nan, dtype=np.float32)
     
-    goal_pos = np.asarray(planning_obs["goal_pos"]).reshape(-1, 3)[0]  # (3,)
-    tcp_pose = np.asarray(planning_obs["tcp_pose"]).reshape(-1, 7)[0]  # (7,)
+    goal_pos = np.asarray(planning_obs["goal_pos"]).reshape(-1, 3)[0]
+    tcp_pose = np.asarray(planning_obs["tcp_pose"]).reshape(-1, 7)[0]
     
-    # Ensure target_obj_pose is a numpy array
-    if target_obj_pose is None:
-        target_obj_pose = np.full((7,), np.nan, dtype=np.float32)
     target_obj_pos = target_obj_pose[:3]
-    tcp_pos = tcp_pose[:3]
+    tcp = tcp_pose[:3]
+    obj = target_obj_pos
+    goal = goal_pos
     
-    # Handle NaN TCP position
-    if np.any(np.isnan(tcp_pos)):
+    # Handle NaN values
+    if np.any(np.isnan(tcp)):
         try:
             if wrapper.agent and hasattr(wrapper.agent, 'tcp'):
                 tcp_pose_direct = wrapper.agent.tcp.pose
-                tcp_pos = np.asarray(tcp_pose_direct.p, dtype=np.float32)
+                tcp = np.asarray(tcp_pose_direct.p, dtype=np.float32)
             else:
-                tcp_pos = np.array([0.3, 0.0, 0.6], dtype=np.float32)
+                tcp = np.array([0.3, 0.0, 0.6], dtype=np.float32)
         except Exception:
-            tcp_pos = np.array([0.3, 0.0, 0.6], dtype=np.float32)
+            tcp = np.array([0.3, 0.0, 0.6], dtype=np.float32)
     
-    # Handle NaN target object position (object might not exist)
-    if np.any(np.isnan(target_obj_pos)):
-        # Fallback: try to get from obj_poses array
+    if np.any(np.isnan(obj)):
         if "obj_poses" in planning_obs:
             obj_poses = np.asarray(planning_obs["obj_poses"])
             if len(obj_poses) > target_obj_id:
-                target_obj_pose = obj_poses[target_obj_id]
-                target_obj_pos = target_obj_pose[:3]
+                obj = obj_poses[target_obj_id][:3]
+            elif len(obj_poses) > 0:
+                obj = obj_poses[0][:3]
             else:
-                target_obj_pos = np.array([0.6, 0.0, 0.8], dtype=np.float32)
+                obj = np.array([0.6, 0.0, 0.8], dtype=np.float32)
         else:
-            target_obj_pos = np.array([0.6, 0.0, 0.8], dtype=np.float32)
+            obj = np.array([0.6, 0.0, 0.8], dtype=np.float32)
     
-    tcp_to_obj_dist = np.linalg.norm(tcp_pos - target_obj_pos)
-    obj_to_goal_dist = np.linalg.norm(target_obj_pos - goal_pos)
+    # Stop if object already near goal (xy)
+    if np.linalg.norm((obj - goal)[:2]) < GOAL_CLOSE_XY:
+        ctx["phase"] = 4  # done
     
-    # Build action
-    sample = wrapper.action_space.sample()
-    action = np.zeros_like(sample, dtype=np.float32)
-    action_flat = action.reshape(-1)
+    # Get shelf bounds if available to avoid hitting walls
+    shelf_min_x = None
+    shelf_max_x = None
+    if "bay_center" in planning_obs and "bay_size" in planning_obs:
+        bay_center = np.asarray(planning_obs["bay_center"]).reshape(-1, 3)[0]
+        bay_size = np.asarray(planning_obs["bay_size"]).reshape(-1, 3)[0]
+        shelf_min_x = float(bay_center[0] - bay_size[0] / 2.0)
+        shelf_max_x = float(bay_center[0] + bay_size[0] / 2.0)
     
-    next_phase = phase
-    
-    if phase == "approach":
-        # Phase 1: Approach the target object
-        if tcp_to_obj_dist > APPROACH_DIST:
-            direction = target_obj_pos - tcp_pos
-            dist = np.linalg.norm(direction)
-            if dist > 1e-4:
-                direction = direction / dist
-                step = min(APPROACH_STEP_SIZE, dist - APPROACH_DIST)
-                delta_pos = direction * step
-            else:
-                delta_pos = np.zeros(3, dtype=np.float32)
+    # Compute push direction in XY (goal - object) once; keep it fixed for a straight-line shove
+    if "push_dir_xy" not in ctx:
+        d_xy = (goal - obj)[:2]
+        n = float(np.linalg.norm(d_xy))
+        if n < 1e-6:
+            push_dir_xy = np.array([1.0, 0.0], dtype=np.float32)
         else:
-            # Close enough, switch to pull phase
-            next_phase = "pull"
-            delta_pos = np.zeros(3, dtype=np.float32)
+            push_dir_xy = (d_xy / n).astype(np.float32)
+        ctx["push_dir_xy"] = push_dir_xy
+        
+        # For shelf: robot is at x=-0.3 (left), objects at x~0.45 (inside), goal at x>0.45 (outside)
+        # Push direction is +x (towards goal/right)
+        # Position TCP from robot's side (left/smaller x) to push object right (+x)
+        # "Behind" in push direction means opposite to push, so -push_dir = left side (robot's side)
+        contact_xy_candidate = obj[:2] - push_dir_xy * CONTACT_EPS
+        
+        # Ensure contact point is not too far into shelf (avoid back wall)
+        # If shelf bounds available, clamp to be at least 0.02m from back wall
+        if shelf_min_x is not None:
+            min_safe_x = shelf_min_x + 0.02  # 2cm from back wall
+            if contact_xy_candidate[0] < min_safe_x:
+                contact_xy_candidate[0] = min_safe_x
+        
+        ctx["pre_xy"] = obj[:2] - push_dir_xy * BACKOFF  # Approach from left (robot side)
+        ctx["contact_xy"] = contact_xy_candidate  # Contact position (slightly behind object, but safe from wall)
+    else:
+        push_dir_xy = ctx["push_dir_xy"]
+        pre_xy = ctx["pre_xy"]
+        contact_xy = ctx["contact_xy"]
     
-    elif phase == "pull":
-        # Phase 2: Pull target object toward goal
-        if obj_to_goal_dist > 0.05:  # Still need to pull
-            # Move TCP in direction from object to goal
-            # But maintain some distance from object
-            pull_direction = goal_pos - target_obj_pos
-            pull_dist = np.linalg.norm(pull_direction)
-            
-            if pull_dist > 1e-4:
-                pull_direction = pull_direction / pull_dist
-                
-                # Target TCP position: slightly behind object in pull direction
-                target_tcp_pos = target_obj_pos - APPROACH_DIST * 0.5 * pull_direction
-                tcp_to_target = target_tcp_pos - tcp_pos
-                tcp_to_target_dist = np.linalg.norm(tcp_to_target)
-                
-                if tcp_to_target_dist > 0.01:
-                    # Move TCP toward target position
-                    direction = tcp_to_target / tcp_to_target_dist
-                    step = min(PULL_STEP_SIZE, tcp_to_target_dist)
-                    delta_pos = direction * step
-                else:
-                    # TCP is in good position, move object directly
-                    step = min(PULL_STEP_SIZE, pull_dist)
-                    delta_pos = pull_direction * step
-            else:
-                delta_pos = np.zeros(3, dtype=np.float32)
-        else:
-            # Object is close to goal, fine-tune
-            direction = goal_pos - tcp_pos
-            dist = np.linalg.norm(direction)
-            if dist > 1e-4:
-                direction = direction / dist
-                step = min(PULL_STEP_SIZE * 0.5, dist)
-                delta_pos = direction * step
-            else:
-                delta_pos = np.zeros(3, dtype=np.float32)
+    # Pre-contact: approach from robot's side (left, smaller x), then contact slightly behind object
+    pre_xy = ctx.get("pre_xy", obj[:2] - push_dir_xy * BACKOFF)
+    contact_xy = ctx.get("contact_xy", obj[:2] - push_dir_xy * CONTACT_EPS)
     
-    action_flat[:3] = delta_pos
-    return action, next_phase
+    # Heights
+    z_above = float(obj[2] + ABOVE_Z)
+    z_push = float(obj[2] + PUSH_Z_OFFSET)
+    
+    phase = ctx.get("phase", 0)
+    
+    # Phase 0: initialize ctx
+    if phase == 0:
+        ctx["phase"] = 1
+        ctx["push_steps"] = 0
+    
+    # Phase 1: go above pre-contact
+    if ctx["phase"] == 1:
+        target = np.array([pre_xy[0], pre_xy[1], z_above], dtype=np.float32)
+        delta = move_towards(tcp, target, STEP_SIZE)
+        if np.linalg.norm(target - tcp) < 0.01:
+            ctx["phase"] = 2
+        return make_delta_action(wrapper, delta)
+    
+    # Phase 2: go down to push height at the *contact* XY
+    if ctx["phase"] == 2:
+        target = np.array([contact_xy[0], contact_xy[1], z_push], dtype=np.float32)
+        delta = move_towards(tcp, target, STEP_SIZE)
+        if np.linalg.norm(target - tcp) < 0.008:
+            ctx["phase"] = 3
+        return make_delta_action(wrapper, delta)
+    
+    # Phase 3: push forward in XY while holding Z
+    if ctx["phase"] == 3:
+        ctx["push_steps"] += 1
+        
+        # first few steps: slightly more aggressive to ensure contact
+        fwd = STEP_SIZE
+        if ctx["push_steps"] < 5:
+            fwd = STEP_SIZE * 1.5
+        
+        # move forward along push direction, keep z near push height
+        target = np.array(
+            [tcp[0] + push_dir_xy[0] * fwd,
+             tcp[1] + push_dir_xy[1] * fwd,
+             z_push],
+            dtype=np.float32
+        )
+        delta = move_towards(tcp, target, STEP_SIZE)
+        
+        # stop pushing after some steps or if goal is close
+        if ctx["push_steps"] > 500 or np.linalg.norm((obj - goal)[:2]) < GOAL_CLOSE_XY:
+            ctx["phase"] = 4
+        return make_delta_action(wrapper, delta)
+    
+    # Phase 4: done — hold still
+    return make_delta_action(wrapper, np.zeros(3, dtype=np.float32))
 
 
 def main():
@@ -211,11 +276,11 @@ def main():
         print(f"    Object {i}: {obj_pos}{marker}")
     print()
 
-    # 3) Planning loop with phase tracking
-    phase = "approach"
+    # 3) Planning loop with context-based state machine (following pusht_demo3.py)
+    ctx: dict = {"phase": 0}
     target_obj_traj: List[np.ndarray] = []
     tcp_traj: List[np.ndarray] = []
-    phases_traj: List[str] = []
+    phases_traj: List[int] = []
     all_objects_traj: List[List[np.ndarray]] = [[] for _ in range(len(obj_poses))]
 
     for t in range(MAX_STEPS):
@@ -230,7 +295,7 @@ def main():
         
         target_obj_traj.append(target_obj_pos.copy())
         tcp_traj.append(tcp_pos.copy())
-        phases_traj.append(phase)
+        phases_traj.append(ctx.get("phase", 0))
         
         # Track all objects
         for i, obj_pose in enumerate(obj_poses):
@@ -245,8 +310,11 @@ def main():
         bay_max_x = bay_center[0] + bay_size[0] / 2.0
         is_outside = target_obj_pos[0] > bay_max_x + 0.02
 
-        if t % 20 == 0 or (len(phases_traj) > 1 and phase != phases_traj[-2]):
-            print(f"Step {t:4d} [{phase:8s}]: "
+        phase_names = {0: "init", 1: "above", 2: "descend", 3: "push", 4: "done"}
+        phase_name = phase_names.get(ctx.get("phase", 0), "unknown")
+        
+        if t % 20 == 0 or (len(phases_traj) > 1 and ctx.get("phase", 0) != phases_traj[-2]):
+            print(f"Step {t:4d} [phase={ctx.get('phase', 0)} ({phase_name:8s})]: "
                   f"target_obj=({target_obj_pos[0]:.3f}, {target_obj_pos[1]:.3f}, {target_obj_pos[2]:.3f}), "
                   f"obj->goal={obj_to_goal_dist:.3f}, "
                   f"tcp->obj={tcp_to_obj_dist:.3f}, "
@@ -280,13 +348,8 @@ def main():
         except Exception:
             pass
 
-        # Compute action
-        action, next_phase = multi_object_retrieve_policy(
-            w, obs, phase, target_obj_id=target_obj_id
-        )
-        if next_phase != phase:
-            print(f"  → Phase transition: {phase} → {next_phase}")
-        phase = next_phase
+        # Compute action using context-based policy
+        action = touch_and_push_policy(w, obs, ctx, target_obj_id=target_obj_id)
 
         # Step
         obs, reward, terminated, truncated, info = w.step(action)
@@ -324,9 +387,10 @@ def main():
         print(f"Final distance to goal: {np.linalg.norm(final_obj - goal_pos):.4f} m")
         
         # Phase statistics
-        approach_steps = sum(1 for p in phases_traj if p == "approach")
-        pull_steps = sum(1 for p in phases_traj if p == "pull")
-        print(f"Phase breakdown: approach={approach_steps}, pull={pull_steps}")
+        phase_counts = {}
+        for p in phases_traj:
+            phase_counts[p] = phase_counts.get(p, 0) + 1
+        print(f"Phase breakdown: {phase_counts}")
         
         # Show movement of other objects (demonstrates interaction)
         print("\n  Movement of other objects (shows interaction):")
