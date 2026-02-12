@@ -53,7 +53,7 @@ Issues = "https://github.com/PegasusGTV/Planning_wrapper/issues"
 [project.scripts]
 
 [tool.setuptools]
-packages = ["planning_wrapper"]
+packages = ["planning_wrapper", "envs"]
 
 [tool.setuptools.package-data]
 "*" = ["*.py", "*.yaml", "*.yml"]
