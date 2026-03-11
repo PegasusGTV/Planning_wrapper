@@ -7,104 +7,49 @@ This is just to visually verify physics/contact.
 from typing import Dict, Any
 import time
 import numpy as np
-import sapien
-import torch
-from transforms3d.euler import euler2quat
 
 try:
     import gymnasium as gym
 except ImportError:
     import gym
 
-import mani_skill.envs  # noqa: F401
-from mani_skill.envs.tasks.tabletop.push_t import PushTEnv
-from mani_skill.utils.registration import register_env
-from mani_skill.utils.building import actors
-from mani_skill.utils.structs import Pose
+import envs  # noqa: F401
 
 from planning_wrapper.wrappers.maniskill_planning import ManiSkillPlanningWrapper
 from planning_wrapper.adapters import PushTTaskAdapter
 
 
-# Register a custom environment that extends PushTEnv with an additional object
-@register_env("PushT-WithExtraObject-v1", max_episode_steps=200)
-class PushTWithExtraObjectEnv(PushTEnv):
-    """
-    PushT environment with an additional cube object on the table.
-    Reduced T block mass and friction for easier pushing.
-    """
-    
-    def _load_scene(self, options: dict):
-        # Reduce T block mass and friction to make pushing easier
-        # Original values: T_mass = 0.8, T_dynamic_friction = 3, T_static_friction = 3
-        self.T_mass = 0.2  # Reduced from 0.8 to 0.2 (75% reduction)
-        self.T_dynamic_friction = 0.5  # Reduced from 3 to 0.5
-        self.T_static_friction = 0.5   # Reduced from 3 to 0.5
-        
-        # Call parent's _load_scene to set up the T block and goal
-        super()._load_scene(options)
-        
-        # Add an additional cube object on the table
-        # Create a cube with reasonable size and color
-        self.extra_obj = actors.build_cube(
-            self.scene,
-            half_size=0.02,  # 4cm cube
-            color=np.array([0, 255, 0, 255]) / 255,  # Green color
-            name="extra_cube",
-            body_type="dynamic",
-            initial_pose=sapien.Pose(p=[0.1, 0.1, 0.02]),  # Position on table, above surface
-        )
-    
-    def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
-        # Call parent's _initialize_episode to set up the T block
-        super()._initialize_episode(env_idx, options)
-        
-        # Place the extra object close to the T block
-        with torch.device(self.device):
-            b = len(env_idx)
-            # Get the T block's position
-            tee_pos = self.tee.pose.p  # Shape: (b, 3)
-            
-            # Place the extra cube close to the T block
-            # Offset it slightly to the side and slightly behind
-            extra_obj_xyz = tee_pos.clone()
-            extra_obj_xyz[:, 0] += 0.06  # Offset in x direction (to the side)
-            extra_obj_xyz[:, 1] += 0.04  # Offset in y direction (slightly behind)
-            extra_obj_xyz[:, 2] = 0.02   # Half size of cube (4cm / 2 = 2cm) on table surface
-            
-            # Set the pose of the extra object
-            q = torch.tensor([1.0, 0.0, 0.0, 0.0]).repeat(b, 1)  # No rotation
-            extra_obj_pose = Pose.create_from_pq(p=extra_obj_xyz, q=q)
-            self.extra_obj.set_pose(extra_obj_pose)
-
-
 # ----- Tuning knobs (aggressive enough to make real contact) -----
 MAX_STEPS = 520
-RENDER_SLEEP = 0.02    # ~50 FPS
-STEP_SIZE = 0.003      # slightly smaller step but more controlled
+RENDER_SLEEP = 0.02  # ~50 FPS
+STEP_SIZE = 0.003  # slightly smaller step but more controlled
 PUSH_STEP_SIZE = 0.08  # larger step size for pushing (increases force)
 
 # Get closer and slightly lower so the stick actually hits the T block.
-BACKOFF = 0.010        # closer behind the tee
-ABOVE_Z = 0.03         # approach clearly above the tee
+BACKOFF = 0.010  # closer behind the tee
+ABOVE_Z = 0.03  # approach clearly above the tee
 # Extra Z offset around the very bottom of the T block (see TEE_HALF_THICKNESS / TABLE_CLEARANCE_Z)
 # Positive values push slightly higher than the bottom, negative values slightly lower (but still clamped).
 PUSH_Z_OFFSET = -0.01  # default: push ~1 cm lower than the bottom clearance reference
-CONTACT_EPS = 0.010    # aim a full 1 cm into the face
-GOAL_CLOSE_XY = 0.03   # stop if object is close in XY
+CONTACT_EPS = 0.010  # aim a full 1 cm into the face
+GOAL_CLOSE_XY = 0.03  # stop if object is close in XY
 PUSH_FORCE_MULTIPLIER = 10.0  # multiplier for push force (higher = more force)
-AGGRESSIVE_PUSH_STEPS = 100   # number of steps with extra aggressive pushing
-HIDE_OBJ_ORI = True    # match PushT-v1 GT demo
+AGGRESSIVE_PUSH_STEPS = 100  # number of steps with extra aggressive pushing
+HIDE_OBJ_ORI = True  # match PushT-v1 GT demo
 
 # Geometry of the T block for contact height computation
-TEE_HALF_THICKNESS = 0.02      # half of 0.04 m (from PushT env)
+TEE_HALF_THICKNESS = 0.02  # half of 0.04 m (from PushT env)
 # Keep TCP very close to the table; raise if you see table collisions.
-TABLE_CLEARANCE_Z = 0.0003     # 0.3 mm above the table
+TABLE_CLEARANCE_Z = 0.0003  # 0.3 mm above the table
 
 
 def mask_obj_orientation_in_obs(obs: Dict[str, Any]) -> Dict[str, Any]:
     """Optional: keep obj_pose length the same but wipe quaternion."""
-    if not isinstance(obs, dict) or "extra" not in obs or "obj_pose" not in obs["extra"]:
+    if (
+        not isinstance(obs, dict)
+        or "extra" not in obs
+        or "obj_pose" not in obs["extra"]
+    ):
         return obs
     obs2 = dict(obs)
     extra2 = dict(obs["extra"])
@@ -136,22 +81,24 @@ def _goal_pos(planning_obs):
     return gp[:3].copy()
 
 
-def make_delta_action(wrapper: ManiSkillPlanningWrapper, delta_xyz: np.ndarray) -> np.ndarray:
+def make_delta_action(
+    wrapper: ManiSkillPlanningWrapper, delta_xyz: np.ndarray
+) -> np.ndarray:
     """
     pd_ee_delta_pose: first 3 dims are delta position.
     The controller normalizes actions, so we need to convert raw delta (in meters)
     to the normalized action space [-1, 1].
-    
+
     Formula: normalized = (delta - 0.5*(high+low)) / (0.5*(high-low))
     For bounds [-0.1, 0.1]: normalized = delta / 0.1
     """
     # Get controller bounds from wrapper
     low, high = wrapper.get_controller_bounds()
-    
+
     sample = wrapper.action_space.sample()
     action = np.zeros_like(sample, dtype=np.float32)
     flat = action.reshape(-1)
-    
+
     # Convert delta from meters to normalized action space
     # Inverse of clip_and_scale_action: normalized = (delta - center) / half_range
     center = 0.5 * (high + low)
@@ -161,10 +108,10 @@ def make_delta_action(wrapper: ManiSkillPlanningWrapper, delta_xyz: np.ndarray) 
         normalized_delta = np.zeros_like(delta_xyz, dtype=np.float32)
     else:
         normalized_delta = (delta_xyz - center) / half_range
-    
+
     # Clip to [-1, 1] to respect action space bounds
     normalized_delta = np.clip(normalized_delta, -1.0, 1.0)
-    
+
     flat[:3] = normalized_delta.astype(np.float32)
     return action
 
@@ -178,7 +125,9 @@ def move_towards(curr: np.ndarray, target: np.ndarray, max_step: float) -> np.nd
     return (d / dist * step).astype(np.float32)
 
 
-def touch_and_push_policy(wrapper: ManiSkillPlanningWrapper, obs: Dict[str, Any], ctx: Dict[str, Any]) -> np.ndarray:
+def touch_and_push_policy(
+    wrapper: ManiSkillPlanningWrapper, obs: Dict[str, Any], ctx: Dict[str, Any]
+) -> np.ndarray:
     """
     Simple state machine (matching the known-good pusht_demo4):
       0) compute push direction, pre-contact point
@@ -217,7 +166,9 @@ def touch_and_push_policy(wrapper: ManiSkillPlanningWrapper, obs: Dict[str, Any]
 
     # Pre-contact point: behind object along push direction (cached once above)
     pre_xy = ctx.get("pre_xy", obj[:2] - push_dir_xy * BACKOFF)
-    contact_xy = ctx.get("contact_xy", obj[:2] - push_dir_xy * CONTACT_EPS)  # closer to the block face
+    contact_xy = ctx.get(
+        "contact_xy", obj[:2] - push_dir_xy * CONTACT_EPS
+    )  # closer to the block face
 
     # Heights
     z_above = float(obj[2] + ABOVE_Z)
@@ -264,10 +215,8 @@ def touch_and_push_policy(wrapper: ManiSkillPlanningWrapper, obs: Dict[str, Any]
 
         # move forward along push direction, keep z near push height
         target = np.array(
-            [tcp[0] + push_dir_xy[0] * fwd,
-             tcp[1] + push_dir_xy[1] * fwd,
-             z_push],
-            dtype=np.float32
+            [tcp[0] + push_dir_xy[0] * fwd, tcp[1] + push_dir_xy[1] * fwd, z_push],
+            dtype=np.float32,
         )
         # Use the calculated fwd as max_step to allow the full movement
         delta = move_towards(tcp, target, fwd)
@@ -305,17 +254,19 @@ def main():
         extra = obs["extra"]
         obj_pose = np.asarray(extra["obj_pose"])
         goal_pos = np.asarray(extra["goal_pos"])
-        
+
         # Debug prints: check TCP-obj distance to verify contact
         planning_obs = w.get_planning_obs(obs)
         tcp = _tcp_pos(planning_obs)
         obj = _obj_pos(planning_obs)
         dist_xy = np.linalg.norm((tcp - obj)[:2])
         dz = tcp[2] - obj[2]
-        
+
         if t % 20 == 0:
-            print(f"[t={t}] obj_pos={obj_pose[:3]} goal_pos={goal_pos[:3]} "
-                  f"phase={ctx.get('phase')} dist_xy={dist_xy:.4f} dz={dz:.4f}")
+            print(
+                f"[t={t}] obj_pos={obj_pose[:3]} goal_pos={goal_pos[:3]} "
+                f"phase={ctx.get('phase')} dist_xy={dist_xy:.4f} dz={dz:.4f}"
+            )
 
         try:
             w.render()
@@ -337,4 +288,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
