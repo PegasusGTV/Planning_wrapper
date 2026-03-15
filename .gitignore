@@ -36,5 +36,8 @@ ENV/
 .DS_Store
 Thumbs.db
 
+# Logs and databases
+/demos/
+
 
 
