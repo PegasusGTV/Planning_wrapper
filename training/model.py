@@ -1,16 +1,14 @@
 """
-2D Diffusion Transformer (DiT) — unified sequence model.
+2D Diffusion Transformer (DiT) — separate state and action tokens.
 
-The model sees a single flat sequence of T tokens.
-Every token = state_proj(x_state) + action_proj(x_action) + pos_embed + t_embed(t_i)
+Token layout: [s_0, a_0, s_1, a_1, ..., s_{T-1}, a_{T-1}]  →  length 2T
 
-There is no hard context/future distinction in the architecture.
-The caller controls which frames are conditioned vs generated solely through
-the timestep values it passes in ([B, T] — one per frame).
+Attention rules (causal=True):
+  - Any token at timestep t can attend to all tokens at timesteps 0..t,
+    including both the state and action at the same timestep t.
+  - This is a block-lower-triangular mask with 2×2 blocks.
 
-Causal mask (cfg.causal=True)
-  Frame j attends only to frames 0..j.
-  Useful for autoregressive-style generation.
+Timestep conditioning uses AdaLN-Zero per block, as before.
 """
 
 import math
@@ -24,9 +22,9 @@ import torch.nn.functional as F
 
 @dataclass
 class ModelConfig:
-    state_dim:  int   = 32
-    action_dim: int   = 7
-    seq_len:    int   = 18      # T
+    state_dim:  int   = 18
+    action_dim: int   = 9
+    seq_len:    int   = 100      # T  (number of timesteps, not tokens)
     dim:        int   = 256
     depth:      int   = 6
     heads:      int   = 8
@@ -36,14 +34,10 @@ class ModelConfig:
 
 
 # ---------------------------------------------------------------------------
-# Sinusoidal timestep embedding
+# Sinusoidal timestep embedding  (unchanged)
 # ---------------------------------------------------------------------------
 
 class SinusoidalEmbed(nn.Module):
-    """
-    Sinusoidal embed + MLP projection.
-    Accepts any integer tensor [...]; returns [..., dim].
-    """
     def __init__(self, dim: int, max_period: int = 10_000):
         super().__init__()
         self.dim = dim
@@ -68,113 +62,134 @@ class SinusoidalEmbed(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Transformer block  (pre-norm, full self-attention)
+# AdaLN-Zero  (unchanged)
+# ---------------------------------------------------------------------------
+
+class AdaLNZero(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.norm       = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(dim, 3 * dim, bias=True),
+        )
+        nn.init.zeros_(self.modulation[-1].weight)
+        nn.init.zeros_(self.modulation[-1].bias)
+
+    def forward(
+        self, x: torch.Tensor, c: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        shift, scale, gate = self.modulation(c).chunk(3, dim=-1)
+        x = self.norm(x) * (1 + scale) + shift
+        return x, gate
+
+
+# ---------------------------------------------------------------------------
+# Transformer block  (unchanged from previous rewrite)
 # ---------------------------------------------------------------------------
 
 class Block(nn.Module):
-    """
-    Pre-norm block: LN → QKV self-attention → residual → LN → MLP → residual.
-
-    attn_mask: additive float [T, T] where 0.0 = attend, −∞ = block.
-    SDPA broadcasts over batch and head dims automatically.
-    """
     def __init__(self, dim: int, heads: int, dropout: float = 0.0, mlp_ratio: float = 4.0):
         super().__init__()
         assert dim % heads == 0
         self.heads    = heads
         self.head_dim = dim // heads
+        self.drop     = dropout
 
-        self.norm1 = nn.LayerNorm(dim)
-        self.qkv   = nn.Linear(dim, dim * 3, bias=True)
-        self.proj  = nn.Linear(dim, dim, bias=True)
-        self.drop  = dropout
+        self.adaLN1 = AdaLNZero(dim)
+        self.qkv    = nn.Linear(dim, dim * 3, bias=True)
+        self.proj   = nn.Linear(dim, dim, bias=True)
 
-        self.norm2 = nn.LayerNorm(dim)
-        hidden     = int(dim * mlp_ratio)
-        self.mlp   = nn.Sequential(
+        self.adaLN2 = AdaLNZero(dim)
+        hidden      = int(dim * mlp_ratio)
+        self.mlp    = nn.Sequential(
             nn.Linear(dim, hidden), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(hidden, dim), nn.Dropout(dropout),
         )
 
     def forward(
         self,
-        x:         torch.Tensor,                   # [B, T, dim]
-        attn_mask: Optional[torch.Tensor] = None,  # [T, T] additive float
+        x:         torch.Tensor,                   # [B, 2T, dim]
+        c:         torch.Tensor,                   # [B, 2T, dim]
+        attn_mask: Optional[torch.Tensor] = None,  # [2T, 2T] additive float
     ) -> torch.Tensor:
-        B, T, d = x.shape
+        B, N, d = x.shape
         H, Dh   = self.heads, self.head_dim
 
-        h   = self.norm1(x)
-        qkv = self.qkv(h).reshape(B, T, 3, H, Dh).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)   # each [B, H, T, Dh]
-
+        h, gate_attn = self.adaLN1(x, c)
+        qkv = self.qkv(h).reshape(B, N, 3, H, Dh).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
         out = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask = attn_mask,
             dropout_p = self.drop if self.training else 0.0,
         )
-        out = out.transpose(1, 2).reshape(B, T, d)
-        x   = x + self.proj(out)
-        x   = x + self.mlp(self.norm2(x))
+        out = out.transpose(1, 2).reshape(B, N, d)
+        x   = x + gate_attn * self.proj(out)
+
+        h, gate_mlp = self.adaLN2(x, c)
+        x = x + gate_mlp * self.mlp(h)
         return x
 
 
 # ---------------------------------------------------------------------------
-# DiT
+# DiT  — separate state / action tokens
 # ---------------------------------------------------------------------------
 
 class DiT(nn.Module):
     """
-    Unified sequence DiT.
+    Separate state and action tokens, interleaved as [s_0, a_0, s_1, a_1, ...].
 
     Input
     -----
-      noisy_seq  : [B, T, state_dim + action_dim]   — all frames, already noised by caller
-      timesteps  : [B, T]                            — per-frame noise level (int, 0..N)
+      states     : [B, T, state_dim]
+      actions    : [B, T, action_dim]
+      timesteps  : [B, T]  — per-frame noise level
 
     Output
     ------
-      [B, T, state_dim + action_dim]  — predicted velocity / epsilon / x0
-
-    Notes
-    -----
-    • state_proj and action_proj take the per-frame state and action slices.
-    • Each token's embedding includes its individual timestep so the model
-      knows exactly how noisy each frame is.
-    • Positional embedding is learned and frame-index based.
-    • The output head is zero-initialised for stable training start.
+      state_pred  : [B, T, state_dim]
+      action_pred : [B, T, action_dim]
     """
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
         d        = cfg.dim
-        SD, AD   = cfg.state_dim, cfg.action_dim
 
-        # Input projections — applied per-frame
+        # Separate input projections
         self.state_proj  = nn.Sequential(
-            nn.Linear(SD, d), nn.SiLU(), nn.Linear(d, d)
+            nn.Linear(cfg.state_dim, d), nn.SiLU(), nn.Linear(d, d)
         )
-        self.action_proj = nn.Linear(AD, d)
+        self.action_proj = nn.Linear(cfg.action_dim, d)
 
-        # Per-frame timestep embedding
-        self.time_embed = SinusoidalEmbed(d)
-
-        # Learned positional embedding over sequence positions
-        self.pos_embed = nn.Parameter(torch.zeros(cfg.seq_len, d))
+        # Positional embedding indexed by timestep (shared across state/action at same t)
+        self.pos_embed  = nn.Parameter(torch.zeros(cfg.seq_len, d))
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
 
-        # Transformer
+        # Type embedding: index 0 = state, index 1 = action
+        self.type_embed = nn.Parameter(torch.zeros(2, d))
+        nn.init.trunc_normal_(self.type_embed, std=0.02)
+
+        # Per-frame timestep embedding — used as conditioning c, not added to tokens
+        self.time_embed = SinusoidalEmbed(d)
+
+        # Transformer blocks over the 2T token sequence
         self.blocks = nn.ModuleList([
             Block(d, cfg.heads, cfg.dropout, cfg.mlp_ratio)
             for _ in range(cfg.depth)
         ])
 
-        # Output head — zero-init for stable early training
-        self.norm = nn.LayerNorm(d)
-        self.head = nn.Linear(d, SD + AD)
-        nn.init.zeros_(self.head.weight)
-        nn.init.zeros_(self.head.bias)
+        # Separate output heads for states and actions
+        self.state_norm = nn.LayerNorm(d)
+        self.state_head = nn.Linear(d, cfg.state_dim)
+        nn.init.zeros_(self.state_head.weight)
+        nn.init.zeros_(self.state_head.bias)
+
+        self.action_norm = nn.LayerNorm(d)
+        self.action_head = nn.Linear(d, cfg.action_dim)
+        nn.init.zeros_(self.action_head.weight)
+        nn.init.zeros_(self.action_head.bias)
 
         # Causal mask cache
         self._mask:     Optional[torch.Tensor] = None
@@ -183,41 +198,72 @@ class DiT(nn.Module):
     def _get_causal_mask(
         self, T: int, device: torch.device, dtype: torch.dtype
     ) -> torch.Tensor:
-        """[T, T] lower-triangular additive float mask. Cached by (T, device, dtype)."""
+        """
+        Block-lower-triangular mask over 2T tokens.
+
+        Token layout: [s_0, a_0, s_1, a_1, ...]
+        Token i is at timestep i // 2.
+        Token i may attend to token j iff timestep(i) >= timestep(j),
+        i.e. i // 2 >= j // 2  — so same-timestep pairs fully see each other.
+
+        Returns additive float mask [2T, 2T]: 0.0 = attend, -inf = block.
+        """
+        N = 2 * T
         key = (T, device, dtype)
         if self._mask_key != key:
-            m = torch.full((T, T), float("-inf"), device=device, dtype=dtype)
-            m.masked_fill_(torch.tril(torch.ones(T, T, device=device, dtype=torch.bool)), 0.0)
+            # timestep index for each of the 2T positions
+            ts = torch.arange(N, device=device) // 2          # [2T]
+            allowed = ts[:, None] >= ts[None, :]              # [2T, 2T] bool
+            m = torch.zeros(N, N, device=device, dtype=dtype)
+            m.masked_fill_(~allowed, float("-inf"))
             self._mask, self._mask_key = m, key
         return self._mask
 
     def forward(
         self,
-        noisy_seq:  torch.Tensor,   # [B, T, state_dim + action_dim]
-        timesteps:  torch.Tensor,   # [B, T]   integer noise levels
-    ) -> torch.Tensor:              # [B, T, state_dim + action_dim]
-        B, T, _ = noisy_seq.shape
-        SD       = self.cfg.state_dim
+        states:    torch.Tensor,   # [B, T, state_dim]
+        actions:   torch.Tensor,   # [B, T, action_dim]
+        timesteps: torch.Tensor,   # [B, T]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, T, _ = states.shape
 
-        # Split packed input back into state / action
-        states  = noisy_seq[..., :SD]   # [B, T, SD]
-        actions = noisy_seq[..., SD:]   # [B, T, AD]
-
-        # Build per-frame tokens
-        # [B, T, d] = state_embed + action_embed + pos_embed + t_embed
-        t_emb  = self.time_embed(timesteps)            # [B, T, d]  — per-frame
-        tokens = (
-            self.state_proj(states)                    # [B, T, d]
-            + self.action_proj(actions)                # [B, T, d]
-            + self.pos_embed[:T]                       # [T, d]   broadcasts over B
-            + t_emb                                    # [B, T, d]
+        # --- Build token sequence [s_0, a_0, s_1, a_1, ...] ---
+        # Each of shape [B, T, d]
+        s_tokens = (
+            self.state_proj(states)
+            + self.pos_embed[:T]          # [T, d] broadcasts over B
+            + self.type_embed[0]          # scalar [d] broadcast
+        )
+        a_tokens = (
+            self.action_proj(actions)
+            + self.pos_embed[:T]
+            + self.type_embed[1]
         )
 
+        # Interleave into [B, 2T, d]:  dim-1 becomes [s_0, a_0, s_1, a_1, ...]
+        tokens = torch.stack([s_tokens, a_tokens], dim=2)  # [B, T, 2, d]
+        tokens = tokens.reshape(B, 2 * T, -1)              # [B, 2T, d]
+
+        # --- Conditioning: repeat each timestep embedding for its two tokens ---
+        c = self.time_embed(timesteps)                     # [B, T, d]
+        c = c.unsqueeze(2).expand(-1, -1, 2, -1)          # [B, T, 2, d]
+        c = c.reshape(B, 2 * T, -1)                       # [B, 2T, d]
+
+        # --- Attention mask ---
         attn_mask = None
         if self.cfg.causal:
             attn_mask = self._get_causal_mask(T, tokens.device, tokens.dtype)
 
+        # --- Transformer ---
         for block in self.blocks:
-            tokens = block(tokens, attn_mask=attn_mask)
+            tokens = block(tokens, c, attn_mask=attn_mask)
 
-        return self.head(self.norm(tokens))            # [B, T, SD + AD]
+        # --- Uninterleave and project to outputs ---
+        tokens = tokens.reshape(B, T, 2, -1)               # [B, T, 2, d]
+        s_out  = tokens[:, :, 0, :]                         # [B, T, d]
+        a_out  = tokens[:, :, 1, :]                         # [B, T, d]
+
+        state_pred  = self.state_head(self.state_norm(s_out))    # [B, T, state_dim]
+        action_pred = self.action_head(self.action_norm(a_out))  # [B, T, action_dim]
+
+        return state_pred, action_pred

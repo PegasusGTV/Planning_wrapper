@@ -46,7 +46,7 @@ train:
 
 log:
   dir:          ./training_runs
-  project:      dit_2d
+  project:      dit_2d_new
   entity:       null
   every:        100
   val_every:    1000

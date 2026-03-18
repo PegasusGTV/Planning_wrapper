@@ -11,7 +11,7 @@ Usage
 import argparse
 from itertools import cycle
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -60,23 +60,25 @@ class EMA:
 
 
 # ---------------------------------------------------------------------------
-# Normalisation helpers
+# Normalisation helpers  — replace the two pack/unpack helpers with these
 # ---------------------------------------------------------------------------
 
-def pack_norm(seq: torch.Tensor, norm: NormStats) -> torch.Tensor:
-    """Normalise a packed [B, T, SD+AD] tensor using per-split stats."""
+def normalize(seq: torch.Tensor, norm: NormStats) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Split and normalise a packed [B, T, SD+AD] tensor."""
     SD = norm.state.mean.shape[0]
-    s  = norm.state .normalize(seq[..., :SD])
-    a  = norm.action.normalize(seq[..., SD:])
-    return torch.cat([s, a], dim=-1)
+    return (
+        norm.state .normalize(seq[..., :SD]),
+        norm.action.normalize(seq[..., SD:]),
+    )
 
-
-def unpack_denorm(seq: torch.Tensor, norm: NormStats) -> torch.Tensor:
-    """Inverse of pack_norm."""
-    SD = norm.state.mean.shape[0]
-    s  = norm.state .denormalize(seq[..., :SD])
-    a  = norm.action.denormalize(seq[..., SD:])
-    return torch.cat([s, a], dim=-1)
+def denormalize(
+    states: torch.Tensor, actions: torch.Tensor, norm: NormStats
+) -> torch.Tensor:
+    """Denormalise and repack to [B, T, SD+AD]."""
+    return torch.cat([
+        norm.state .denormalize(states),
+        norm.action.denormalize(actions),
+    ], dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -92,19 +94,25 @@ def train_step(
     device:    torch.device,
     grad_clip: Optional[float],
 ) -> dict:
-    seq   = seq.to(device)
-    B, T  = seq.shape[:2]
+    seq  = seq.to(device)
+    B, T = seq.shape[:2]
 
-    x_0   = pack_norm(seq, norm)
-    noise = torch.randn_like(x_0)
+    s_0, a_0 = normalize(seq, norm)                              # [B, T, SD], [B, T, AD]
 
-    # Every frame gets its own independent noise level
+    s_noise = torch.randn_like(s_0)
+    a_noise = torch.randn_like(a_0)
+
     timesteps = diffusion.sample_timesteps(B, device, num_frames=T)   # [B, T]
 
-    x_t    = diffusion.add_noise(x_0, noise, timesteps)
-    pred   = model(x_t, timesteps)
-    target = diffusion.get_target(x_0, noise, timesteps)
-    loss   = F.mse_loss(pred, target)
+    s_t = diffusion.add_noise(s_0, s_noise, timesteps)
+    a_t = diffusion.add_noise(a_0, a_noise, timesteps)
+
+    s_pred, a_pred = model(s_t, a_t, timesteps)
+
+    s_target = diffusion.get_target(s_0, s_noise, timesteps)
+    a_target = diffusion.get_target(a_0, a_noise, timesteps)
+
+    loss = F.mse_loss(s_pred, s_target) + F.mse_loss(a_pred, a_target)
 
     optimizer.zero_grad()
     loss.backward()
@@ -144,12 +152,21 @@ def validate(
                 break
             seq  = seq.to(device)
             B, T = seq.shape[:2]
-            x_0  = pack_norm(seq, norm)
-            noise = torch.randn_like(x_0)
-            ts    = diffusion.sample_timesteps(B, device, num_frames=T)
-            x_t   = diffusion.add_noise(x_0, noise, ts)
-            pred  = model(x_t, ts)
-            total += F.mse_loss(pred, diffusion.get_target(x_0, noise, ts)).item()
+
+            s_0, a_0 = normalize(seq, norm)
+            s_noise, a_noise = torch.randn_like(s_0), torch.randn_like(a_0)
+            ts = diffusion.sample_timesteps(B, device, num_frames=T)
+
+            s_t = diffusion.add_noise(s_0, s_noise, ts)
+            a_t = diffusion.add_noise(a_0, a_noise, ts)
+
+            s_pred, a_pred = model(s_t, a_t, ts)
+
+            loss = (
+                F.mse_loss(s_pred, diffusion.get_target(s_0, s_noise, ts))
+                + F.mse_loss(a_pred, diffusion.get_target(a_0, a_noise, ts))
+            )
+            total += loss.item()
             count += 1
     finally:
         ema.restore()
@@ -164,7 +181,7 @@ def validate(
 @torch.no_grad()
 def run_inference(
     model:                torch.nn.Module,
-    seq:                  torch.Tensor,        # [B, T, SD+AD]  raw — used as ground truth
+    seq:                  torch.Tensor,        # [B, T, SD+AD]  raw
     diffusion:            Union[FlowMatching, DDIM],
     norm:                 NormStats,
     n_steps:              int,
@@ -173,32 +190,25 @@ def run_inference(
     df_schedule:          str       = "pyramid",
     df_uncertainty_scale: float     = 1.0,
 ) -> dict:
-    """
-    Full denoising pass with optional conditioning.
-
-    cond_frames
-    -----------
-    Frame indices whose clean signal is known (e.g. the first two observed
-    frames).  They are initialised from x_0, their timesteps are pinned to 0,
-    and they are re-injected after every step so the scheduler never drifts them.
-    Set cond_frames=[] for unconditional generation from pure noise.
-    """
     B, T, _ = seq.shape
-    D       = seq.shape[-1]
+    SD       = norm.state.mean.shape[0]
 
-    x_0_norm = pack_norm(seq.to(device), norm)    # [B, T, D]
+    s_0, a_0 = normalize(seq.to(device), norm)   # [B, T, SD], [B, T, AD]
 
-    # Initialise x_t
-    x_t = torch.randn(B, T, D, device=device)
+    # Initialise from noise
+    s_t = torch.randn_like(s_0)
+    a_t = torch.randn_like(a_0)
+
     if cond_frames:
         cond_idx = list(cond_frames)
-        x_t[:, cond_idx] = x_0_norm[:, cond_idx]
+        s_t[:, cond_idx] = s_0[:, cond_idx]
+        a_t[:, cond_idx] = a_0[:, cond_idx]
 
-    # Build scheduling matrix over the non-conditioned frames only
+    # Scheduling matrix (over non-conditioned frames only)
     gen_mask    = torch.ones(T, dtype=torch.bool, device=device)
     if cond_frames:
         gen_mask[list(cond_frames)] = False
-    gen_indices = gen_mask.nonzero(as_tuple=True)[0]   # [n_gen]
+    gen_indices = gen_mask.nonzero(as_tuple=True)[0]
     n_gen       = len(gen_indices)
 
     K_full  = generate_scheduling_matrix(n_gen, n_steps, df_schedule, df_uncertainty_scale)
@@ -211,37 +221,38 @@ def run_inference(
     if not is_fm:
         ac = diffusion.scheduler.alphas_cumprod.to(device=device, dtype=torch.float32)
 
-    # Denoising loop
     for m in range(len(K_ts) - 1):
-        curr_k = K_ts[m]       # [n_gen]
-        next_k = K_ts[m + 1]   # [n_gen]
+        curr_k = K_ts[m]
+        next_k = K_ts[m + 1]
 
-        # Full per-frame timestep vector — conditioning frames always at t=0
         t_batch = torch.zeros(B, T, device=device, dtype=torch.long)
         t_batch[:, gen_indices] = curr_k.unsqueeze(0).expand(B, -1)
 
-        pred = model(x_t, t_batch)   # [B, T, D]
+        s_pred, a_pred = model(s_t, a_t, t_batch)   # [B, T, SD], [B, T, AD]
 
         if is_fm:
             dt    = (curr_k - next_k).float() / diffusion.num_train_timesteps
-            x_new = x_t[:, gen_indices] - dt[None, :, None] * pred[:, gen_indices]
+            s_new = s_t[:, gen_indices] - dt[None, :, None] * s_pred[:, gen_indices]
+            a_new = a_t[:, gen_indices] - dt[None, :, None] * a_pred[:, gen_indices]
         else:
-            a_t  = ac[curr_k][None, :, None]
-            a_p  = ac[next_k][None, :, None]
-            eps  = pred[:, gen_indices]
-            x0   = (x_t[:, gen_indices] - (1 - a_t).sqrt() * eps) / a_t.sqrt().clamp(min=1e-8)
-            x_new = a_p.sqrt() * x0 + (1 - a_p).sqrt() * eps
+            a_t_coef  = ac[curr_k][None, :, None]
+            a_p_coef  = ac[next_k][None, :, None]
+            s_eps, a_eps = s_pred[:, gen_indices], a_pred[:, gen_indices]
+            s_x0  = (s_t[:, gen_indices] - (1 - a_t_coef).sqrt() * s_eps) / a_t_coef.sqrt().clamp(min=1e-8)
+            a_x0  = (a_t[:, gen_indices] - (1 - a_t_coef).sqrt() * a_eps) / a_t_coef.sqrt().clamp(min=1e-8)
+            s_new = a_p_coef.sqrt() * s_x0 + (1 - a_p_coef).sqrt() * s_eps
+            a_new = a_p_coef.sqrt() * a_x0 + (1 - a_p_coef).sqrt() * a_eps
 
-        changed = (curr_k != next_k)[None, :, None].expand(B, -1, D)
-        x_t[:, gen_indices] = torch.where(changed, x_new, x_t[:, gen_indices])
+        changed = (curr_k != next_k)[None, :, None].expand(B, n_gen, -1)
+        s_t[:, gen_indices] = torch.where(changed.expand_as(s_new), s_new, s_t[:, gen_indices])
+        a_t[:, gen_indices] = torch.where(changed.expand_as(a_new), a_new, a_t[:, gen_indices])
 
-        # Re-inject conditioning frames
         if cond_frames:
-            x_t[:, cond_idx] = x_0_norm[:, cond_idx]
+            s_t[:, cond_idx] = s_0[:, cond_idx]
+            a_t[:, cond_idx] = a_0[:, cond_idx]
 
-    pred_raw = unpack_denorm(x_t, norm)
+    pred_raw = denormalize(s_t, a_t, norm)
     gt_raw   = seq.to(device)
-    SD       = norm.state.mean.shape[0]
 
     return {
         "mse":        F.mse_loss(pred_raw,           gt_raw          ).item(),
@@ -250,8 +261,6 @@ def run_inference(
         "pred":       pred_raw,
         "gt":         gt_raw,
     }
-
-
 # ---------------------------------------------------------------------------
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
