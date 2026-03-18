@@ -60,7 +60,7 @@ class EMA:
 
 
 # ---------------------------------------------------------------------------
-# Normalisation helpers  — replace the two pack/unpack helpers with these
+# Normalisation helpers
 # ---------------------------------------------------------------------------
 
 def normalize(seq: torch.Tensor, norm: NormStats) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -261,7 +261,258 @@ def run_inference(
         "pred":       pred_raw,
         "gt":         gt_raw,
     }
+
+
 # ---------------------------------------------------------------------------
+# 3D point-cloud visualisation helpers (mirrors scripts/vis_lowdim.py)
+# ---------------------------------------------------------------------------
+
+_VIS_BLOCK_COLOR = np.array([0.20, 0.47, 0.96])   # blue
+_VIS_HAND_COLOR  = np.array([0.91, 0.47, 0.10])   # orange
+_VIS_GHOST_COLOR = np.array([0.20, 0.95, 0.60])   # green
+
+_VIS_BLOCK_HALF = 0.025
+_VIS_T_BOXES = [
+    (np.array([0.0, -0.0375/2, 0.0]),                np.array([0.05, 0.0125, 0.02])),
+    (np.array([0.0, 4*0.0125 - 0.0375/2, 0.0]),      np.array([0.0125, 0.075*0.75, 0.02])),
+]
+_VIS_STICK_RADIUS = 0.008
+_VIS_STICK_LENGTH = 0.10
+_VIS_STICK_OFFSET_Z = -0.05
+
+
+def _vis_rot6d_to_rotmat(r6: np.ndarray) -> np.ndarray:
+    r1 = r6[:3].astype(np.float64)
+    r2 = r6[3:].astype(np.float64)
+    a1 = r1 / np.linalg.norm(r1)
+    a2 = r2 - np.dot(r2, a1) * a1
+    a2 = a2 / np.linalg.norm(a2)
+    a3 = np.cross(a1, a2)
+    return np.stack([a1, a2, a3], axis=-1)
+
+
+def _vis_apply_pose_9d(pts: np.ndarray, pose_9d: np.ndarray) -> np.ndarray:
+    pos = pose_9d[:3].astype(np.float64)
+    R   = _vis_rot6d_to_rotmat(pose_9d[3:9])
+    return (pts.astype(np.float64) @ R.T + pos).astype(np.float32)
+
+
+def _vis_sample_box(offset, half, n, rng):
+    n_init = n * 20
+    hx, hy, hz = half
+    areas  = np.array([4*hy*hz, 4*hx*hz, 4*hx*hy], dtype=np.float64)
+    counts = np.round(areas / areas.sum() * n_init).astype(int)
+    counts[-1] += n_init - counts.sum()
+    pts = []
+    if counts[0] > 0:
+        s = rng.choice([-1.0, 1.0], counts[0])
+        pts.append(np.stack([s*hx, rng.uniform(-hy,hy,counts[0]), rng.uniform(-hz,hz,counts[0])], 1))
+    if counts[1] > 0:
+        s = rng.choice([-1.0, 1.0], counts[1])
+        pts.append(np.stack([rng.uniform(-hx,hx,counts[1]), s*hy, rng.uniform(-hz,hz,counts[1])], 1))
+    if counts[2] > 0:
+        s = rng.choice([-1.0, 1.0], counts[2])
+        pts.append(np.stack([rng.uniform(-hx,hx,counts[2]), rng.uniform(-hy,hy,counts[2]), s*hz], 1))
+    initial = np.concatenate(pts).astype(np.float32) + np.asarray(offset, dtype=np.float32)
+    idx = rng.choice(len(initial), size=min(n, len(initial)), replace=False)
+    return initial[idx]
+
+
+def _vis_sample_cylinder(offset_z, radius, length, n, rng):
+    n_init = n * 20
+    th  = rng.uniform(0, 2*np.pi, n_init)
+    z   = rng.uniform(-length/2, length/2, n_init) + offset_z
+    pts = np.stack([radius*np.cos(th), radius*np.sin(th), z], 1).astype(np.float32)
+    idx = rng.choice(len(pts), size=min(n, len(pts)), replace=False)
+    return pts[idx]
+
+
+def _vis_build_templates(n_block: int, n_hand: int, rng, use_T: bool) -> dict:
+    if use_T:
+        areas     = [2*(4*hy*hz+4*hx*hz+4*hx*hy) for _, (hx,hy,hz) in _VIS_T_BOXES]
+        total     = sum(areas)
+        t_parts   = [_vis_sample_box(off, half, max(1, int(n_block*a/total)), rng)
+                     for (off, half), a in zip(_VIS_T_BOXES, areas)]
+        block_tpl = np.concatenate(t_parts)
+    else:
+        block_tpl = _vis_sample_box(
+            np.zeros(3), np.full(3, _VIS_BLOCK_HALF), n_block, rng
+        )
+    hand_tpl = _vis_sample_cylinder(
+        _VIS_STICK_OFFSET_Z, _VIS_STICK_RADIUS, _VIS_STICK_LENGTH, n_hand, rng
+    )
+    return {"block": block_tpl, "hand": hand_tpl}
+
+
+def _vis_render_single_frame(
+    states_gt:   np.ndarray,   # [18]
+    actions_gt:  np.ndarray,   # [9]
+    states_pr:   np.ndarray,   # [18]
+    actions_pr:  np.ndarray,   # [9]
+    templates:   dict,
+    lims:        list,          # [(xlo,xhi),(ylo,yhi),(zlo,zhi)]
+    t:           int,
+    T:           int,
+    elev:        float,
+    azim:        float,
+    ghost_alpha: float,
+    cond_frames: List[int],
+    dpi:         int = 100,
+) -> np.ndarray:
+    """Render one GIF frame: GT (left) and Pred (right) side-by-side 3D scatter."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig = plt.figure(figsize=(10, 5), dpi=dpi)
+
+    for col, (states, actions, label) in enumerate([
+        (states_gt, actions_gt, f"GT   t={t}/{T-1}"),
+        (states_pr, actions_pr, f"Pred t={t}/{T-1}"),
+    ]):
+        ax = fig.add_subplot(1, 2, col + 1, projection="3d")
+
+        tcp_9d   = states[0:9]
+        block_9d = states[9:18]
+        act_9d   = actions[0:9]
+
+        hand_pts  = _vis_apply_pose_9d(templates["hand"],  tcp_9d)
+        block_pts = _vis_apply_pose_9d(templates["block"], block_9d)
+        ghost_pts = _vis_apply_pose_9d(templates["hand"],  act_9d)
+
+        ax.scatter(block_pts[:,0], block_pts[:,1], block_pts[:,2],
+                   s=1.2, c=[_VIS_BLOCK_COLOR.tolist()], depthshade=True,
+                   alpha=0.6, label="block")
+        ax.scatter(hand_pts[:,0],  hand_pts[:,1],  hand_pts[:,2],
+                   s=2.5, c=[_VIS_HAND_COLOR.tolist()],  depthshade=True,
+                   alpha=0.9, label="TCP (now)")
+        ax.scatter(ghost_pts[:,0], ghost_pts[:,1], ghost_pts[:,2],
+                   s=2.5, c=[_VIS_GHOST_COLOR.tolist()], depthshade=True,
+                   alpha=ghost_alpha, label="action target")
+
+        if t in cond_frames:
+            ax.scatter(*hand_pts.mean(0), marker="D", s=60,
+                       c=[[1.0, 1.0, 0.2]], zorder=6, alpha=0.9)
+
+        (xlo, xhi), (ylo, yhi), (zlo, zhi) = lims
+        ax.set_xlim(xlo, xhi); ax.set_ylim(ylo, yhi); ax.set_zlim(zlo, zhi)
+        ax.set_box_aspect([1, 1, 1])
+        ax.view_init(elev=elev, azim=azim)
+        ax.set_xlabel("X", fontsize=6); ax.set_ylabel("Y", fontsize=6)
+        ax.set_zlabel("Z", fontsize=6); ax.tick_params(labelsize=5)
+        ax.set_title(label, fontsize=8)
+        if col == 0:
+            ax.legend(fontsize=6, loc="upper right", markerscale=3)
+
+    fig.suptitle(
+        "Blue=block  Orange=TCP  Green=action target  ◆=cond frame",
+        fontsize=7,
+    )
+    fig.tight_layout(pad=0.5)
+    fig.canvas.draw()
+    w, h_px = fig.canvas.get_width_height()
+    buf = np.frombuffer(fig.canvas.tostring_argb(), dtype=np.uint8)
+    img = buf.reshape(h_px, w, 4)[:, :, 1:]   # ARGB -> RGB
+    plt.close(fig)
+    return img.copy()
+
+
+# ---------------------------------------------------------------------------
+# Prediction visualisation — one GIF per sample, GT vs Pred side-by-side
+# ---------------------------------------------------------------------------
+
+def visualize_predictions(
+    model:       torch.nn.Module,
+    seq:         torch.Tensor,             # [B, T, SD+AD] raw
+    diffusion:   Union[FlowMatching, DDIM],
+    norm:        NormStats,
+    n_steps:     int,
+    device:      torch.device,
+    save_dir:    Path,
+    step:        int,
+    cond_frames: List[int] = (),
+    n_samples:   int = 4,
+    use_T_block: bool = False,
+    every:       int = 5,
+    n_block_pts: int = 400,
+    n_hand_pts:  int = 250,
+    elev:        float = 30.0,
+    azim:        float = -60.0,
+    ghost_alpha: float = 0.35,
+    gif_fps:     float = 10.0,
+) -> None:
+    """
+    Run inference on n_samples trajectories and save one GIF per sample to
+        <save_dir>/step_XXXXXXX/sample_N.gif
+
+    Each GIF animates over the T timesteps (subsampled by `every`).
+    Every frame shows GT (left) and Predicted (right) as 3D point clouds,
+    matching the exact style of scripts/vis_lowdim.py.
+    """
+    import imageio
+
+    n_samples = min(n_samples, seq.shape[0])
+    sub_seq   = seq[:n_samples].to(device)
+
+    model.eval()
+    with torch.no_grad():
+        result = run_inference(
+            model, sub_seq, diffusion, norm,
+            n_steps=n_steps, device=device,
+            cond_frames=cond_frames,
+        )
+    model.train()
+
+    SD      = norm.state.mean.shape[0]   # 18
+    pred_np = result["pred"].cpu().numpy()   # [n_samples, T, 27]
+    gt_np   = result["gt"].cpu().numpy()
+
+    # Fixed-seed templates so point cloud shape doesn't jitter across calls
+    rng       = np.random.default_rng(0)
+    templates = _vis_build_templates(n_block_pts, n_hand_pts, rng, use_T_block)
+
+    step_dir = save_dir / f"step_{step:07d}"
+    step_dir.mkdir(parents=True, exist_ok=True)
+
+    T      = gt_np.shape[1]
+    frames = list(range(0, T, every))
+
+    for i in range(n_samples):
+        gt_states   = gt_np  [i, :, :SD]   # [T, 18]
+        gt_actions  = gt_np  [i, :, SD:]   # [T, 9]
+        pr_states   = pred_np[i, :, :SD]
+        pr_actions  = pred_np[i, :, SD:]
+
+        # Axis limits computed from GT so GT and Pred share the same scale
+        all_pos = np.concatenate([gt_states[:, 0:3], gt_states[:, 9:12]], axis=0)
+        pad = 0.06
+        ctr = all_pos.mean(0)
+        r   = max((all_pos.max(0) - all_pos.min(0)).max() / 2 + pad, 0.08)
+        lims = [(float(ctr[j] - r), float(ctr[j] + r)) for j in range(3)]
+
+        gif_frames = []
+        for t in frames:
+            img = _vis_render_single_frame(
+                states_gt   = gt_states[t],
+                actions_gt  = gt_actions[t],
+                states_pr   = pr_states[t],
+                actions_pr  = pr_actions[t],
+                templates   = templates,
+                lims        = lims,
+                t           = t,
+                T           = T,
+                elev        = elev,
+                azim        = azim,
+                ghost_alpha = ghost_alpha,
+                cond_frames = cond_frames,
+            )
+            gif_frames.append(img)
+
+        out_path = step_dir / f"sample_{i}.gif"
+        imageio.mimsave(str(out_path), gif_frames,
+                        duration=1.0 / gif_fps, loop=0)
+        print(f"  ↳ saved GIF -> {out_path}")
+
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
 
@@ -310,6 +561,7 @@ def main(cfg):
 
     run_dir  = Path(cfg.log.dir) / cfg.run_name
     ckpt_dir = run_dir / "checkpoints"
+    vis_dir  = run_dir / "visualisations"   # ← new: where PNGs are saved
     run_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir.mkdir(exist_ok=True)
     OmegaConf.save(cfg, run_dir / "config.yaml")
@@ -324,7 +576,7 @@ def main(cfg):
         tmp_loader = DataLoader(train_ds, batch_size=cfg.data.batch_size, shuffle=True)
         cached     = [next(iter(tmp_loader)) for _ in range(cfg.train.overfit_batches)]
         train_iter = cycle(cached)
-        val_loader = cached   # iterate directly in validate
+        val_loader = cached
     else:
         train_loader = DataLoader(
             train_ds, batch_size=cfg.data.batch_size, shuffle=True,
@@ -381,6 +633,21 @@ def main(cfg):
 
     cond_frames = list(cfg.log.get("inference_cond_frames", []))
 
+    # Stash a fixed visualisation batch sampled with wide stride so the
+    # n_samples sequences come from very different parts of the dataset —
+    # consecutive windows from an unshuffled loader would be nearly identical
+    # because NpzDataset slides a 1-step window, making samples 0,1,2,3
+    # differ by only one timestep.
+    _vis_batch: Optional[torch.Tensor] = None
+    try:
+        n_vis = cfg.log.get("vis_n_samples", 4)
+        ds_len = len(val_ds)
+        # Pick n_vis indices spread uniformly across the dataset
+        vis_indices = [int(i * ds_len / n_vis) for i in range(n_vis)]
+        _vis_batch = torch.stack([val_ds[idx] for idx in vis_indices])
+    except Exception as e:
+        print(f"  [warn] could not build vis batch: {e}")
+
     # -------------------------------------------------------------------------
     model.train()
     step, log_loss = start_step, 0.0
@@ -404,12 +671,39 @@ def main(cfg):
                 msg += f" | gnorm {metrics['grad_norm']:.2f}"
             print(msg)
 
-        # Validation
+        # Validation + visualisation (same frequency)
         if step > 0 and step % cfg.log.val_every == 0:
             val_m = validate(model, val_loader, diffusion, norm, ema, device, cfg.log.val_batches)
             print(f"step {step:06d} | val_loss {val_m['loss']:.4f}")
 
-        # Inference / sampling
+            # ── Prediction visualisation ─────────────────────────────────────
+            if _vis_batch is not None:
+                ema.apply_shadow()
+                try:
+                    visualize_predictions(
+                        model       = model,
+                        seq         = _vis_batch,
+                        diffusion   = diffusion,
+                        norm        = norm,
+                        n_steps     = n_inf_steps,
+                        device      = device,
+                        save_dir    = vis_dir,
+                        step        = step,
+                        cond_frames = cond_frames,
+                        n_samples   = cfg.log.get("vis_n_samples",   4),
+                        use_T_block = cfg.log.get("vis_use_T_block",  False),
+                        every       = cfg.log.get("vis_every",        5),
+                        ghost_alpha = cfg.log.get("vis_ghost_alpha",  0.35),
+                        elev        = cfg.log.get("vis_elev",         30.0),
+                        azim        = cfg.log.get("vis_azim",        -60.0),
+                    )
+                except Exception as e:
+                    print(f"  [warn] visualisation failed at step {step}: {e}")
+                finally:
+                    ema.restore()
+                    model.train()
+
+        # Inference / sampling (kept at its own cadence)
         if step > 0 and step % cfg.log.sample_every == 0:
             ema.apply_shadow()
             model.eval()

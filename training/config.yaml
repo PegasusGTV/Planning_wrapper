@@ -49,10 +49,16 @@ log:
   project:      dit_2d_new
   entity:       null
   every:        100
-  val_every:    1000
+  val_every:    100
   val_batches:  10
   save_every:   10000
   sample_every: 5000
+  vis_n_samples:   4
+  vis_use_T_block: false   # true if your block is T-shaped
+  vis_every:       5       # subsample every N frames
+  vis_ghost_alpha: 0.35
+  vis_elev:        30.0
+  vis_azim:        -60.0
   # Frames to treat as conditioning at inference time.
   # e.g. [0, 1] means frames 0 and 1 are held clean; the rest are generated.
   # Set to [] to do unconditional generation from pure noise.
