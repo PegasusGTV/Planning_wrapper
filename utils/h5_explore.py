@@ -40,5 +40,5 @@ def explore_h5(file_path):
 
 if __name__ == "__main__":
     # Replace this with the path to your file
-    target_file = "<PATH_TO_YOUR_H5_FILE>" 
+    target_file = "/Users/mbronars/workspace/CMU/Sp26/Planning/class_project/packages/Planning_wrapper/demos/PushBoundary/push_demos.h5" 
     explore_h5(target_file)
