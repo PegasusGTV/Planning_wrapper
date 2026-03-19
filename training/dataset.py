@@ -58,20 +58,45 @@ class NpzDataset(TrajectoryDataset):
 # Normalisation
 # ---------------------------------------------------------------------------
 
-def compute_norm_stats(dataset: TrajectoryDataset, max_samples: int = 50_000) -> NormStats:
-    """
-    Compute per-dimension mean/std over up to max_samples dataset items.
-    """
-    SD = dataset.state_dim
-    all_seqs = []
-    for i in range(min(len(dataset), max_samples)):
-        all_seqs.append(dataset[i])                    # [T, SD+AD]
+# def compute_norm_stats(dataset: TrajectoryDataset, max_samples: int = 50_000) -> NormStats:
+#     """
+#     Compute per-dimension mean/std over up to max_samples dataset items.
+#     """
+#     SD = dataset.state_dim
+#     all_seqs = []
+#     for i in range(min(len(dataset), max_samples)):
+#         all_seqs.append(dataset[i])                    # [T, SD+AD]
 
-    data = torch.stack(all_seqs).reshape(-1, all_seqs[0].shape[-1])  # [N*T, SD+AD]
-    s    = data[:, :SD]
-    a    = data[:, SD:]
+#     data = torch.stack(all_seqs).reshape(-1, all_seqs[0].shape[-1])  # [N*T, SD+AD]
+#     s    = data[:, :SD]
+#     a    = data[:, SD:]
 
-    return NormStats(
-        state  = Stats(s.mean(0), s.std(0).clamp(min=1e-6)),
-        action = Stats(a.mean(0), a.std(0).clamp(min=1e-6)),
+#     return NormStats(
+#         state  = Stats(s.mean(0), s.std(0).clamp(min=1e-6)),
+#         action = Stats(a.mean(0), a.std(0).clamp(min=1e-6)),
+#     )
+
+# def compute_norm_stats(dataset: NpzDataset) -> Stats:
+#     # accumulate over full dataset in one pass
+#     all_seqs = []
+#     loader   = DataLoader(dataset, batch_size=256, shuffle=False, num_workers=4)
+#     for seq in loader:
+#         all_seqs.append(seq)
+#     all_seqs = torch.cat(all_seqs, dim=0)   # [N, T, SD+AD]
+#     flat     = all_seqs.reshape(-1, all_seqs.shape[-1])  # [N*T, SD+AD]
+
+#     return Stats(
+#         mean = flat.mean(0),
+#         std  = flat.std(0).clamp(min=1e-8),
+#     )
+
+def compute_norm_stats(dataset: NpzDataset) -> Stats:
+    # states and actions are already loaded as numpy arrays
+    s = torch.from_numpy(dataset.states.reshape(-1, dataset.state_dim))   # [N*T, SD]
+    a = torch.from_numpy(dataset.actions.reshape(-1, dataset.action_dim)) # [N*T, AD]
+    bundle = torch.cat([s, a], dim=-1)                                     # [N*T, SD+AD]
+
+    return Stats(
+        mean = bundle.mean(0),
+        std  = bundle.std(0).clamp(min=1e-8),
     )

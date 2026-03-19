@@ -156,6 +156,7 @@ class DiT(nn.Module):
         super().__init__()
         self.cfg = cfg
         d        = cfg.dim
+        self.state_dim = cfg.state_dim
 
         # Separate input projections
         self.state_proj  = nn.Sequential(

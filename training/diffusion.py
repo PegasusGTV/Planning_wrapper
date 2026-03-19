@@ -26,16 +26,29 @@ from diffusers import FlowMatchEulerDiscreteScheduler, DDIMScheduler
 # Normalisation helpers
 # ---------------------------------------------------------------------------
 
+# @dataclass
+# class Stats:
+#     mean: torch.Tensor   # [dim]
+#     std:  torch.Tensor   # [dim]
+
+#     def normalize(self, x: torch.Tensor) -> torch.Tensor:
+#         return (x - self.mean.to(x)) / (self.std.to(x) + 1e-8)
+
+#     def denormalize(self, x: torch.Tensor) -> torch.Tensor:
+#         return x * (self.std.to(x) + 1e-8) + self.mean.to(x)
+
+# In diffusion.py, replace NormStats / Stats with a single Stats:
+
 @dataclass
 class Stats:
-    mean: torch.Tensor   # [dim]
-    std:  torch.Tensor   # [dim]
+    mean: torch.Tensor   # [state_dim + action_dim]
+    std:  torch.Tensor   # [state_dim + action_dim]
 
     def normalize(self, x: torch.Tensor) -> torch.Tensor:
-        return (x - self.mean.to(x)) / (self.std.to(x) + 1e-8)
+        return (x - self.mean.to(x.device)) / (self.std.to(x.device) + 1e-8)
 
     def denormalize(self, x: torch.Tensor) -> torch.Tensor:
-        return x * (self.std.to(x) + 1e-8) + self.mean.to(x)
+        return x * (self.std.to(x.device) + 1e-8) + self.mean.to(x.device)
 
 
 @dataclass
@@ -70,6 +83,12 @@ class FlowMatching:
     ) -> torch.Tensor:
         shape = (B, num_frames) if num_frames is not None else (B,)
         return torch.randint(0, self.num_train_timesteps, shape, device=device)
+    
+    # # Inside diffusion.py
+    # def sample_timesteps(self, B, device, num_frames):
+    #     # One random timestep per batch element
+    #     t = torch.randint(0, self.num_train_timesteps, (B, 1), device=device)
+    #     return t.expand(B, num_frames) # Shape: [B, T]
 
     def add_noise(
         self, x_0: torch.Tensor, noise: torch.Tensor, timesteps: torch.Tensor

@@ -10,6 +10,7 @@ Usage
 
 import argparse
 from itertools import cycle
+import math
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
@@ -20,7 +21,7 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
 from model      import DiT, ModelConfig
-from diffusion  import FlowMatching, DDIM, NormStats
+from diffusion  import FlowMatching, DDIM, NormStats, Stats
 from dataset    import NpzDataset, compute_norm_stats
 from scheduling import generate_scheduling_matrix
 
@@ -57,28 +58,55 @@ class EMA:
 
     def state_dict(self):          return {k: v.clone() for k, v in self.shadow.items()}
     def load_state_dict(self, sd): self.shadow = {k: v.clone() for k, v in sd.items()}
+    
+class SNRWeighting:
+    def __init__(self, diffusion, snr_clip: float = 5.0):
+        if isinstance(diffusion, DDIM):
+            ac  = diffusion.scheduler.alphas_cumprod
+            snr = ac / (1.0 - ac)
+        else:  # FlowMatching — approximate SNR from t
+            # t=0 → clean, t=1 → noise; SNR ≈ (1-t)^2 / t^2
+            t   = torch.linspace(1e-3, 1.0 - 1e-3, diffusion.num_train_timesteps)
+            snr = ((1.0 - t) / t) ** 2
+
+        self.snr         = snr
+        self.clipped_snr = snr.clone().clamp_(max=snr_clip)
+
+    def weights(self, timesteps: torch.Tensor) -> torch.Tensor:
+        # timesteps: [B, T] → weights: [B, T]
+        snr         = self.snr        .to(timesteps.device)[timesteps.long()]
+        clipped_snr = self.clipped_snr.to(timesteps.device)[timesteps.long()]
+        return clipped_snr / snr.clamp(min=1e-8)
 
 
 # ---------------------------------------------------------------------------
 # Normalisation helpers
 # ---------------------------------------------------------------------------
 
-def normalize(seq: torch.Tensor, norm: NormStats) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Split and normalise a packed [B, T, SD+AD] tensor."""
-    SD = norm.state.mean.shape[0]
-    return (
-        norm.state .normalize(seq[..., :SD]),
-        norm.action.normalize(seq[..., SD:]),
-    )
+# def normalize(seq: torch.Tensor, norm: NormStats) -> Tuple[torch.Tensor, torch.Tensor]:
+#     """Split and normalise a packed [B, T, SD+AD] tensor."""
+#     SD = norm.state.mean.shape[0]
+#     return (
+#         norm.state .normalize(seq[..., :SD]),
+#         norm.action.normalize(seq[..., SD:]),
+#     )
 
-def denormalize(
-    states: torch.Tensor, actions: torch.Tensor, norm: NormStats
-) -> torch.Tensor:
-    """Denormalise and repack to [B, T, SD+AD]."""
-    return torch.cat([
-        norm.state .denormalize(states),
-        norm.action.denormalize(actions),
-    ], dim=-1)
+# def denormalize(
+#     states: torch.Tensor, actions: torch.Tensor, norm: NormStats
+# ) -> torch.Tensor:
+#     """Denormalise and repack to [B, T, SD+AD]."""
+#     return torch.cat([
+#         norm.state .denormalize(states),
+#         norm.action.denormalize(actions),
+#     ], dim=-1)
+
+def normalize(seq: torch.Tensor, norm: Stats, SD: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    bundle = norm.normalize(seq)      
+    return bundle[..., :SD], bundle[..., SD:]
+
+def denormalize(states: torch.Tensor, actions: torch.Tensor, norm: Stats) -> torch.Tensor:
+    bundle = torch.cat([states, actions], dim=-1)
+    return norm.denormalize(bundle)
 
 
 # ---------------------------------------------------------------------------
@@ -87,22 +115,28 @@ def denormalize(
 
 def train_step(
     model:     torch.nn.Module,
-    seq:       torch.Tensor,               # [B, T, SD+AD]  raw
+    seq:       torch.Tensor,
     diffusion: Union[FlowMatching, DDIM],
     norm:      NormStats,
     optimizer: torch.optim.Optimizer,
     device:    torch.device,
     grad_clip: Optional[float],
+    snr:       SNRWeighting,                  # ← add this
 ) -> dict:
     seq  = seq.to(device)
     B, T = seq.shape[:2]
 
-    s_0, a_0 = normalize(seq, norm)                              # [B, T, SD], [B, T, AD]
+    s_0, a_0  = normalize(seq, norm, model.state_dim)
+    # s_noise   = torch.randn_like(s_0)
+    # a_noise   = torch.randn_like(a_0)
+    s_noise = torch.randn_like(s_0).clamp(-20.0, 20.0)
+    a_noise = torch.randn_like(a_0).clamp(-20.0, 20.0)
+    timesteps = diffusion.sample_timesteps(B, device, num_frames=T)
 
-    s_noise = torch.randn_like(s_0)
-    a_noise = torch.randn_like(a_0)
-
-    timesteps = diffusion.sample_timesteps(B, device, num_frames=T)   # [B, T]
+    # Condition first frame at low noise ~50% of the time
+    if torch.rand(1).item() < 0.5:
+        max_cond_t = diffusion.num_train_timesteps // 4
+        timesteps[:, 0] = torch.randint(0, max_cond_t, (B,), device=device)
 
     s_t = diffusion.add_noise(s_0, s_noise, timesteps)
     a_t = diffusion.add_noise(a_0, a_noise, timesteps)
@@ -112,7 +146,12 @@ def train_step(
     s_target = diffusion.get_target(s_0, s_noise, timesteps)
     a_target = diffusion.get_target(a_0, a_noise, timesteps)
 
-    loss = F.mse_loss(s_pred, s_target) + F.mse_loss(a_pred, a_target)
+    # Per-token SNR weights, shape [B, T] → [B, T, 1] for broadcasting
+    w = snr.weights(timesteps).unsqueeze(-1)
+
+    s_loss = (F.mse_loss(s_pred, s_target, reduction="none") * w).mean()
+    a_loss = (F.mse_loss(a_pred, a_target, reduction="none") * w).mean()
+    loss   = s_loss + a_loss
 
     optimizer.zero_grad()
     loss.backward()
@@ -123,7 +162,10 @@ def train_step(
 
     optimizer.step()
 
-    metrics = {"loss": loss.item(), "t_mean": timesteps.float().mean().item()}
+    metrics = {
+        "loss": loss.item(), "s_loss": s_loss.item(), "a_loss": a_loss.item(),
+        "t_mean": timesteps.float().mean().item(),
+    }
     if grad_norm is not None:
         metrics["grad_norm"] = grad_norm
     return metrics
@@ -153,7 +195,7 @@ def validate(
             seq  = seq.to(device)
             B, T = seq.shape[:2]
 
-            s_0, a_0 = normalize(seq, norm)
+            s_0, a_0 = normalize(seq, norm, model.state_dim)
             s_noise, a_noise = torch.randn_like(s_0), torch.randn_like(a_0)
             ts = diffusion.sample_timesteps(B, device, num_frames=T)
 
@@ -191,13 +233,15 @@ def run_inference(
     df_uncertainty_scale: float     = 1.0,
 ) -> dict:
     B, T, _ = seq.shape
-    SD       = norm.state.mean.shape[0]
+    SD       = model.state_dim
 
-    s_0, a_0 = normalize(seq.to(device), norm)   # [B, T, SD], [B, T, AD]
+    s_0, a_0 = normalize(seq.to(device), norm, SD)   # [B, T, SD], [B, T, AD]
 
     # Initialise from noise
-    s_t = torch.randn_like(s_0)
-    a_t = torch.randn_like(a_0)
+    # s_t = torch.randn_like(s_0)
+    # a_t = torch.randn_like(a_0)
+    s_t = torch.randn_like(s_0).clamp(-20.0, 20.0)
+    a_t = torch.randn_like(a_0).clamp(-20.0, 20.0)
 
     if cond_frames:
         cond_idx = list(cond_frames)
@@ -250,17 +294,33 @@ def run_inference(
         if cond_frames:
             s_t[:, cond_idx] = s_0[:, cond_idx]
             a_t[:, cond_idx] = a_0[:, cond_idx]
+            
+    s_mse_norm = F.mse_loss(s_t, s_0).item()
+    a_mse_norm = F.mse_loss(a_t, a_0).item()
 
     pred_raw = denormalize(s_t, a_t, norm)
     gt_raw   = seq.to(device)
+    
+    # In run_inference, add before denormalization:
+    
 
     return {
-        "mse":        F.mse_loss(pred_raw,           gt_raw          ).item(),
+        "mse":        F.mse_loss(pred_raw, gt_raw).item(),
         "state_mse":  F.mse_loss(pred_raw[..., :SD], gt_raw[..., :SD]).item(),
         "action_mse": F.mse_loss(pred_raw[..., SD:], gt_raw[..., SD:]).item(),
-        "pred":       pred_raw,
-        "gt":         gt_raw,
+        "state_mse_norm":  s_mse_norm,    # ← add these
+        "action_mse_norm": a_mse_norm,
+        "pred": pred_raw,
+        "gt":   gt_raw,
     }
+
+    # return {
+    #     "mse":        F.mse_loss(pred_raw,           gt_raw          ).item(),
+    #     "state_mse":  F.mse_loss(pred_raw[..., :SD], gt_raw[..., :SD]).item(),
+    #     "action_mse": F.mse_loss(pred_raw[..., SD:], gt_raw[..., SD:]).item(),
+    #     "pred":       pred_raw,
+    #     "gt":         gt_raw,
+    # }
 
 
 # ---------------------------------------------------------------------------
@@ -433,7 +493,7 @@ def visualize_predictions(
     cond_frames: List[int] = (),
     n_samples:   int = 4,
     use_T_block: bool = False,
-    every:       int = 5,
+    every:       int = 1,
     n_block_pts: int = 400,
     n_hand_pts:  int = 250,
     elev:        float = 30.0,
@@ -463,7 +523,7 @@ def visualize_predictions(
         )
     model.train()
 
-    SD      = norm.state.mean.shape[0]   # 18
+    SD      = model.state_dim   # 18
     pred_np = result["pred"].cpu().numpy()   # [n_samples, T, 27]
     gt_np   = result["gt"].cpu().numpy()
 
@@ -589,10 +649,19 @@ def main(cfg):
         train_iter = cycle(train_loader)
 
     # Normalisation stats
-    print("Computing normalisation stats…")
+    # print("Computing normalisation stats…")
+    # norm = compute_norm_stats(train_ds)
+    # print(f"  state  mean={norm.state.mean.mean():.3f}  std={norm.state.std.mean():.3f}")
+    # print(f"  action mean={norm.action.mean.mean():.3f}  std={norm.action.std.mean():.3f}")
+    # Change this:
+    # print(f"  state  mean={norm.state.mean.mean():.3f}  std={norm.state.std.mean():.3f}")
+    # print(f"  action mean={norm.action.mean.mean():.3f}  std={norm.action.std.mean():.3f}")
+
+    # To this:
     norm = compute_norm_stats(train_ds)
-    print(f"  state  mean={norm.state.mean.mean():.3f}  std={norm.state.std.mean():.3f}")
-    print(f"  action mean={norm.action.mean.mean():.3f}  std={norm.action.std.mean():.3f}")
+    SD = train_ds.state_dim  # or however you access it
+    print(f"  state  mean={norm.mean[:SD].mean():.3f}  std={norm.std[:SD].mean():.3f}")
+    print(f"  action mean={norm.mean[SD:].mean():.3f}  std={norm.std[SD:].mean():.3f}")
 
     # Model
     model_cfg = ModelConfig(**OmegaConf.to_container(cfg.model))
@@ -611,19 +680,31 @@ def main(cfg):
         diffusion   = DDIM(
             num_train_timesteps=cfg.ddim.num_train_timesteps,
             beta_schedule=cfg.ddim.beta_schedule,
-            clip_sample=cfg.ddim.clip_sample,
-            clip_sample_range=cfg.ddim.clip_sample_range,
+            clip_sample=False
+            # clip_sample=cfg.ddim.clip_sample,
+            # clip_sample_range=cfg.ddim.clip_sample_range,
         )
         n_inf_steps = cfg.ddim.inference_steps
     else:
         raise ValueError(f"Unknown denoise_method: {cfg.denoise_method!r}")
+    
+    snr_weighting = SNRWeighting(diffusion, snr_clip=cfg.train.get("snr_clip", 5.0))
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay
     )
-    lr_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=cfg.train.steps, eta_min=cfg.train.lr * 0.01
-    )
+
+    # With this:
+    warmup_steps = cfg.train.get("warmup_steps", 10000)
+
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(warmup_steps, 1)
+        # cosine decay after warmup
+        progress = (step - warmup_steps) / max(cfg.train.steps - warmup_steps, 1)
+        return 0.01 + 0.99 * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    lr_sched = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     ema = EMA(model, decay=cfg.train.ema_decay)
 
     start_step = 0
@@ -655,7 +736,10 @@ def main(cfg):
 
     while step < cfg.train.steps:
         seq     = next(train_iter)
-        metrics = train_step(model, seq, diffusion, norm, optimizer, device, cfg.train.grad_clip)
+        metrics = train_step(
+            model, seq, diffusion, norm, optimizer, device,
+            cfg.train.grad_clip, snr_weighting,        # ← add snr_weighting
+        )
         lr_sched.step()
         ema.update()
         log_loss += metrics["loss"]
@@ -665,8 +749,10 @@ def main(cfg):
             avg      = log_loss / cfg.log.every
             log_loss = 0.0
             lr       = lr_sched.get_last_lr()[0]
-            msg      = (f"step {step:06d} | loss {avg:.4f}"
-                        f" | t_mean {metrics['t_mean']:.0f} | lr {lr:.2e}")
+            # In the logging block, extend the msg:
+            msg = (f"step {step:06d} | loss {avg:.4f}"
+                f" | s_loss {metrics['s_loss']:.4f} | a_loss {metrics['a_loss']:.4f}"
+                f" | t_mean {metrics['t_mean']:.0f} | lr {lr:.2e}")
             if "grad_norm" in metrics:
                 msg += f" | gnorm {metrics['grad_norm']:.2f}"
             print(msg)
@@ -714,8 +800,10 @@ def main(cfg):
                     device=device,
                     cond_frames=cond_frames,
                 )
-                print(f"step {step:06d} | state_mse {inf['state_mse']:.4f}"
-                      f" | action_mse {inf['action_mse']:.4f}")
+                # print(f"step {step:06d} | state_mse {inf['state_mse']:.4f}"
+                #       f" | action_mse {inf['action_mse']:.4f}")
+                print(f"step {step:06d} | state_mse {inf['state_mse']:.4f} (norm: {inf['state_mse_norm']:.4f})"
+                        f" | action_mse {inf['action_mse']:.4f} (norm: {inf['action_mse_norm']:.4f})")
             finally:
                 ema.restore()
                 model.train()
