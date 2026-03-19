@@ -1,4 +1,4 @@
-run_name: dit_2d_xy
+run_name: dit_2d_overfit_
 seed: 42
 resume: null
 
@@ -6,23 +6,32 @@ data:
   train_path: /Users/mbronars/workspace/CMU/Sp26/Planning/class_project/packages/Planning_wrapper/demos/PushBoundary/push_demos_1000.npz  # .npz with keys "states" [N, T, D] and "actions" [N, T, A]
   val_path:   /Users/mbronars/workspace/CMU/Sp26/Planning/class_project/packages/Planning_wrapper/demos/PushBoundary/push_demos_1000.npz
   seq_len:    10               # T — total sequence length per training window
-  batch_size: 32
+  batch_size: 1
   num_workers: 4
 
 model:
-  state_dim: 4
-  seq_len:   10
-  dim:       128
-  depth:     3
-  heads:     4
-  dropout:   0.1
-  mlp_ratio: 4.0
+  state_dim:  18
+  action_dim: 9
+  seq_len:    10               # must match data.seq_len
+  dim:        128
+  depth:      3
+  heads:      4
+  dropout:    0.1
+  mlp_ratio:  4.0
+  causal:     false            # if true: frame j can only attend to frames 0..j
+
+denoise_method: ddim  # "flow_matching" or "ddim"
+
+flow_matching:
+  num_train_timesteps: 1000
+  shift:           1.0
+  inference_steps: 25
 
 ddim:
   num_train_timesteps: 1000
   beta_schedule:       squaredcos_cap_v2
   clip_sample:         true
-  clip_sample_range:   1.0
+  clip_sample_range:   3.0
   inference_steps:     50
 
 train:
@@ -33,7 +42,7 @@ train:
   ema_decay:       0.9999
   mixed_precision: "no"
   grad_accum:      1
-  overfit_batches: -1
+  overfit_batches: 1
 
 log:
   dir:          ./training_runs
