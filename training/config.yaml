@@ -1,4 +1,4 @@
-run_name: dit_2d_overfit_renorm
+run_name: dit_2d_overfit_full_sequence_renorm
 seed: 42
 resume: null
 
@@ -49,10 +49,10 @@ log:
   project:      dit_2d_new
   entity:       null
   every:        100
-  val_every:    5000
+  val_every:    1000
   val_batches:  10
   save_every:   25000
-  sample_every: 5000
+  sample_every: 1000
   vis_n_samples:   4
   vis_use_T_block: false   # true if your block is T-shaped
   vis_every:       1       # subsample every N frames

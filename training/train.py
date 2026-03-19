@@ -134,9 +134,9 @@ def train_step(
     timesteps = diffusion.sample_timesteps(B, device, num_frames=T)
 
     # Condition first frame at low noise ~50% of the time
-    if torch.rand(1).item() < 0.5:
-        max_cond_t = diffusion.num_train_timesteps // 4
-        timesteps[:, 0] = torch.randint(0, max_cond_t, (B,), device=device)
+    # if torch.rand(1).item() < 0.5:
+    #     max_cond_t = diffusion.num_train_timesteps // 4
+    #     timesteps[:, 0] = torch.randint(0, max_cond_t, (B,), device=device)
 
     s_t = diffusion.add_noise(s_0, s_noise, timesteps)
     a_t = diffusion.add_noise(a_0, a_noise, timesteps)
@@ -229,14 +229,14 @@ def run_inference(
     n_steps:              int,
     device:               torch.device,
     cond_frames:          List[int] = (),
-    df_schedule:          str       = "pyramid",
+    df_schedule:          str       = "full_sequence",
     df_uncertainty_scale: float     = 1.0,
 ) -> dict:
     B, T, _ = seq.shape
     SD       = model.state_dim
 
     s_0, a_0 = normalize(seq.to(device), norm, SD)   # [B, T, SD], [B, T, AD]
-
+    cond_frames = None
     # Initialise from noise
     # s_t = torch.randn_like(s_0)
     # a_t = torch.randn_like(a_0)
@@ -264,7 +264,7 @@ def run_inference(
     is_fm = isinstance(diffusion, FlowMatching)
     if not is_fm:
         ac = diffusion.scheduler.alphas_cumprod.to(device=device, dtype=torch.float32)
-
+        
     for m in range(len(K_ts) - 1):
         curr_k = K_ts[m]
         next_k = K_ts[m + 1]
@@ -544,7 +544,14 @@ def visualize_predictions(
         pr_actions  = pred_np[i, :, SD:]
 
         # Axis limits computed from GT so GT and Pred share the same scale
-        all_pos = np.concatenate([gt_states[:, 0:3], gt_states[:, 9:12]], axis=0)
+        # all_pos = np.concatenate([gt_states[:, 0:3], gt_states[:, 9:12]], axis=0)
+
+        # With this:
+        all_pos = np.concatenate([
+            gt_states[:, 0:3], gt_states[:, 9:12],
+            pr_states[:, 0:3], pr_states[:, 9:12],
+        ], axis=0)
+        all_pos = all_pos[np.isfinite(all_pos).all(axis=1)]  # filter NaN/inf from bad preds
         pad = 0.06
         ctr = all_pos.mean(0)
         r   = max((all_pos.max(0) - all_pos.min(0)).max() / 2 + pad, 0.08)
@@ -680,9 +687,8 @@ def main(cfg):
         diffusion   = DDIM(
             num_train_timesteps=cfg.ddim.num_train_timesteps,
             beta_schedule=cfg.ddim.beta_schedule,
-            clip_sample=False
-            # clip_sample=cfg.ddim.clip_sample,
-            # clip_sample_range=cfg.ddim.clip_sample_range,
+            clip_sample=cfg.ddim.clip_sample,
+            clip_sample_range=cfg.ddim.clip_sample_range,
         )
         n_inf_steps = cfg.ddim.inference_steps
     else:
