@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from scipy.spatial.transform import Rotation
 
 import numpy as np
 
@@ -75,8 +76,8 @@ class ScriptedPushPolicy:
     PUSH_STEPS       = 100
     ARRIVE_THRESH    = 0.018
     APPROACH_TIMEOUT = 120
-    XY_SPEED         = 0.1
-    PUSH_SPEED       = 0.08
+    XY_SPEED         = 0.20
+    PUSH_SPEED       = 0.20
 
     CLEAR_DIST = 0.05
 
@@ -515,17 +516,79 @@ def run(args: argparse.Namespace):
         f"steps={args.num_steps}"
     )
     print(f"  block_dims = {base_env.block_dims}")
-
+    
+    target_euler = [np.pi, 0.0, 0.0]
+    r_target = Rotation.from_euler('xyz', target_euler)
+    
     while total_steps < args.num_steps:
         ee_xyz    = _get_xyz(base_env.agent.tcp.pose.p)
         block_xyz = _get_xyz(base_env.block.pose.p)
 
         action     = policy.act(ee_xyz[:2], block_xyz[:2])
         action[2]  = -(ee_xyz[2] - EE_Z)
+        
+        # # 1. Get current rotation matrix
+        # T = base_env.agent.tcp.pose.to_transformation_matrix()
+        # rot_matrix = T[0, :3, :3].cpu().numpy()
+        # r_current = Rotation.from_matrix(rot_matrix)
 
+        # # 2. Calculate the difference: "What rotation takes us from current to target?"
+        # # This multiplies the target rotation by the inverse of the current rotation.
+        # r_diff = r_target * r_current.inv()
+
+        # # 3. Convert that difference into a rotation vector [wx, wy, wz]
+        # # This safely handles all shortest-path wrap-around math under the hood!
+        # rot_err = r_diff.as_rotvec() 
+
+        # # 4. Map the error directly to your actions. 
+        # # (You might need to multiply these by a P-gain, like 0.5 or 1.0, depending on your env)
+        # action[3] = rot_err[0] # X-axis rotation error (Roll)
+        # action[4] = rot_err[1] # Y-axis rotation error (Pitch)
+        # action[5] = rot_err[2] # Z-axis rotation error (Yaw)
+        
         obs, reward, terminated, truncated, info = env.step(action)
         total_steps += 1
         alive_steps += 1
+
+    # while total_steps < args.num_steps:
+    #     ee_xyz    = _get_xyz(base_env.agent.tcp.pose.p)
+    #     block_xyz = _get_xyz(base_env.block.pose.p)
+
+    #     action     = policy.act(ee_xyz[:2], block_xyz[:2])
+    #     action[2]  = -(ee_xyz[2] - EE_Z)
+        
+    #     # 1. Get the matrix (it has an extra batch dimension, so we index [0])
+    #     T = base_env.agent.tcp.pose.to_transformation_matrix()
+
+    #     # 2. Extract the 3x3 rotation matrix and move it to CPU/NumPy
+    #     rot_matrix = T[0, :3, :3].cpu().numpy()
+
+    #     # 3. Initialize SciPy's Rotation object
+    #     r = Rotation.from_matrix(rot_matrix)
+
+    #     # 4. Get the Euler angles. 
+    #     # 'xyz' is standard extrinsic (Roll, Pitch, Yaw). Use degrees=True for easier reading.
+    #     euler_angles = r.as_euler('xyz', degrees=False)
+        
+    #     dif_roll  = min(abs(euler_angles[0]), abs(euler_angles[0] - np.pi), abs(euler_angles[0] + np.pi))
+    #     dif_pitch = min(abs(euler_angles[1]), abs(euler_angles[1] - np.pi), abs(euler_angles[1] + np.pi))
+    #     dif_yaw   = min(abs(euler_angles[2]), abs(euler_angles[2] - np.pi), abs(euler_angles[2] + np.pi))
+        
+    #     print(f"Euler angles (radians): Roll={dif_roll}, Pitch={dif_pitch:.2f}, Yaw={dif_yaw:.2f}")
+    #     action[3] = -(dif_roll - np.pi)  # Roll
+    #     action[4] = -(dif_yaw - 0)       # Pitch
+    #     action[5] = -(dif_pitch - 0)       #
+    #     # print(euler_angles)
+        
+    #     # breakpoint()
+    #     # action[3] = -(base_env.agent.tcp.pose.q[0][0] - 0)
+    #     # action[4] = -(base_env.agent.tcp.pose.q[0][1] - 0)
+    #     # action[5] = -(base_env.agent.tcp.pose.q[0][2] - 1)
+    #     # action[6] = -(base_env.agent.tcp.pose.q[0][3] - 0)
+        
+    #     obs, reward, terminated, truncated, info = env.step(action)
+    #     total_steps += 1
+    #     alive_steps += 1
 
         if terminated or truncated:
             episode += 1
@@ -542,7 +605,7 @@ def run(args: argparse.Namespace):
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Scripted push policy (PushBoundary)")
 
-    p.add_argument("--shape",            type=str, default="cube", choices=["cube", "T"])
+    p.add_argument("--shape",            type=str, default="cube", choices=["cube", "T", "circle"])
     p.add_argument("--num_extra_blocks", type=int, default=0)
     p.add_argument("--mode",       type=str, default="mixed",
                    choices=["standard", "direct", "mixed"])

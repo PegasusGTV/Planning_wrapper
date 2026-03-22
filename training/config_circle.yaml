@@ -1,14 +1,14 @@
-run_name: dit_2d_cube
+run_name: dit_2d_circle
 seed: 42
 resume: null
 
 data:
-  train_path: /data/user_data/mbronars/packages/Planning_wrapper/demos/push_demos_1000.npz  # .npz with keys "states" [N, T, D] and "actions" [N, T, A]
-  val_path:   /data/user_data/mbronars/packages/Planning_wrapper/demos/push_demos_1000.npz
+  train_path: /data/user_data/mbronars/packages/Planning_wrapper/demos/PushBoundary/circle_demos_full.npz  # .npz with keys "states" [N, T, D] and "actions" [N, T, A]
+  val_path:   /data/user_data/mbronars/packages/Planning_wrapper/demos/PushBoundary/circle_demos_full.npz
   seq_len:    100               # T — total sequence length per training window
   batch_size: 512
   num_workers: 4
-  stride: 4
+  stride: 1
 
 model:
   state_dim: 4
@@ -42,10 +42,10 @@ log:
   project:      dit_2d_new
   entity:       null
   every:        100
-  val_every:    500
+  val_every:    5000
   val_batches:  10
   save_every:   25000
-  sample_every: 500
+  sample_every: 5000
   vis_n_samples:   4
   vis_use_T_block: false   # true if your block is T-shaped
   vis_every:       1       # subsample every N frames
@@ -56,4 +56,4 @@ log:
   # e.g. [0, 1] means frames 0 and 1 are held clean; the rest are generated.
   # Set to [] to do unconditional generation from pure noise.
   inference_cond_frames: [0, 1]
-  viz_block_shape: square
+  vis_block_shape: circle

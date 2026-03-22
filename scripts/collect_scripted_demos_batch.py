@@ -277,7 +277,19 @@ def run_cpu(args: argparse.Namespace):
                            _probe.unwrapped.block_dims.half_y)
     _probe.close()
 
-    vec_env = gym.vector.AsyncVectorEnv([
+    # vec_env = gym.vector.AsyncVectorEnv([
+    #     _make_env_fn(
+    #         shape            = args.shape,
+    #         num_extra_blocks = args.num_extra_blocks,
+    #         record_dir       = args.record_dir,
+    #         worker_seed      = worker_seeds[i],
+    #         worker_idx       = i,
+    #     )
+    #     for i in range(N)
+    # ])
+    
+    vec_env = gym.vector.AsyncVectorEnv(
+    [
         _make_env_fn(
             shape            = args.shape,
             num_extra_blocks = args.num_extra_blocks,
@@ -286,7 +298,9 @@ def run_cpu(args: argparse.Namespace):
             worker_idx       = i,
         )
         for i in range(N)
-    ])
+    ],
+    context="spawn",   # ← prevents CUDA re-init error in subprocesses
+)
 
     rngs     = [np.random.default_rng(rng_master.integers(0, 2**32)) for _ in range(N)]
     policies = [
@@ -366,9 +380,9 @@ def parse_args() -> argparse.Namespace:
         description="Batched scripted PushBoundary demo collection"
     )
     # ── same env args as scripted_push.py ──
-    p.add_argument("--shape",            type=str,   default="cube",
-                   choices=["cube", "T"])
-    p.add_argument("--num_extra_blocks", type=int,   default=3)
+    p.add_argument("--shape",            type=str,   default="circle",
+                   choices=["cube", "T", "circle"])
+    p.add_argument("--num_extra_blocks", type=int,   default=0)
     p.add_argument("--mode",             type=str,   default="mixed",
                    choices=["standard", "direct", "mixed"])
     p.add_argument("--record_dir",       type=str,
@@ -376,9 +390,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed",             type=int,   default=None)
 
     # ── batch args ──
-    p.add_argument("--num_envs",   type=int,   default=8,
+    p.add_argument("--num_envs",   type=int,   default=32,
                    help="Parallel environments (default: 8).")
-    p.add_argument("--num_demos",  type=int,   default=200,
+    p.add_argument("--num_demos",  type=int,   default=1000,
                    help="Stop after this many complete episodes (default: 200).")
     p.add_argument("--backend",    type=str,   default="auto",
                    choices=["auto", "cpu", "gpu"],
@@ -388,5 +402,10 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+# if __name__ == "__main__":
+#     run(parse_args())
+
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.set_start_method("spawn", force=True)  # belt-and-suspenders
     run(parse_args())

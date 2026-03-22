@@ -45,6 +45,7 @@ import sapien
 import sapien.render
 import sapien.pysapien.physx as physx
 import torch
+from transforms3d.euler import euler2quat
 
 import mani_skill.envs  # noqa: F401
 from mani_skill.envs.sapien_env import BaseEnv
@@ -79,6 +80,9 @@ T_BAR_HALF_H    = 0.025 / 2   # half-height of the horizontal bar (= bar_half_th
 T_COM_Y         = 0.0375 / 2  # COM offset that centres the shape
 T_HALF_THICK    = 0.02        # flat half-thickness (Z)
 T_Z_SPAWN       = T_HALF_THICK + 1e-3
+
+# Circle block
+CIRCLE_RADIUS   = 0.025
 
 # Extra cubes
 SMALL_HALF  = 0.018
@@ -138,6 +142,15 @@ def _tee_dims() -> BlockDims:
         bar_half_thickness=T_BAR_HALF_H,
         flat_half_thickness=T_HALF_THICK,
     )
+    
+def _circle_dims() -> BlockDims:
+    return BlockDims(
+        half_x=CIRCLE_RADIUS,
+        half_y=CIRCLE_RADIUS,
+        half_z=CIRCLE_RADIUS,
+        bar_half_thickness=None,
+        flat_half_thickness=None,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -165,8 +178,8 @@ class PushBoundaryEnv(BaseEnv):
         valid_starts_file: str = "utils/valid_starts.npy",
         **kwargs,
     ) -> None:
-        if shape not in ("cube", "T"):
-            raise ValueError(f"shape must be 'cube' or 'T', got {shape!r}")
+        if shape not in ("cube", "T", "circle"):
+            raise ValueError(f"shape must be 'cube' or 'T' or 'circle', got {shape!r}")
 
         self.robot_init_qpos_noise = robot_init_qpos_noise
         self.shape = shape
@@ -218,9 +231,15 @@ class PushBoundaryEnv(BaseEnv):
         self.agent.reset(qpos)
 
         # ── main block ────────────────────────────────────────────────────────
-        self.block = (
-            self._build_cube() if self.shape == "cube" else self._build_tee()
-        )
+        if self.shape == "circle":
+            self.block = self._build_circle()
+        elif self.shape =="cube":
+            self.block = self._build_cube()
+        elif self.shape == "T":
+            self.block = self._build_tee()
+        else:
+            raise ValueError(f"Unsupported shape: {self.shape}")
+        
 
         # ── boundary strips ───────────────────────────────────────────────────
         strip_mat = sapien.render.RenderMaterial(
@@ -314,6 +333,28 @@ class PushBoundaryEnv(BaseEnv):
         )
 
         bldr.initial_pose = sapien.Pose(p=[0.0, 0.0, T_Z_SPAWN])
+        return bldr.build(name="push_block")
+    
+    def _build_circle(self):
+        mat  = physx.PhysxMaterial(
+            static_friction=1.0, dynamic_friction=0.8, restitution=0.0
+        )
+        blue = np.array([52, 120, 246, 255]) / 255
+        bldr = self.scene.create_actor_builder()
+        bldr._mass = 0.12
+
+        # main body
+        bldr.add_cylinder_collision(
+            pose = sapien.Pose(p=[0.0, 0.0, CIRCLE_RADIUS + 1e-3], q=euler2quat(0, np.pi / 2, 0)),
+            radius=CIRCLE_RADIUS, half_length=CIRCLE_RADIUS, material=mat, density=200
+        )
+        bldr.add_cylinder_visual(
+            pose = sapien.Pose(p=[0.0, 0.0, CIRCLE_RADIUS + 1e-3], q=euler2quat(0, np.pi / 2, 0)),
+            radius=CIRCLE_RADIUS, half_length=CIRCLE_RADIUS,
+            material=sapien.render.RenderMaterial(base_color=blue),
+        )
+
+        bldr.initial_pose = sapien.Pose(p=[0.0, 0.0, 0.0])
         return bldr.build(name="push_block")
 
     # ── episode init ──────────────────────────────────────────────────────────

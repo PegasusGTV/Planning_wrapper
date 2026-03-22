@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional
 import torch
 from diffusers import DDIMScheduler
 
@@ -34,12 +35,21 @@ class Stats:
 
 
 class DDIM:
+    """
+    DDIM with epsilon (noise) prediction.
+
+      Forward:  x_t = √ᾱ_t · x_0  +  √(1−ᾱ_t) · noise
+      Target:   ε   = noise
+    """
+
+    prediction_type = "epsilon"
+
     def __init__(
         self,
         num_train_timesteps: int   = 1000,
         beta_schedule:       str   = "squaredcos_cap_v2",
         clip_sample:         bool  = True,
-        clip_sample_range:   float = 1.0,
+        clip_sample_range:   float = 2.0,
     ):
         self.num_train_timesteps = num_train_timesteps
         self.scheduler = DDIMScheduler(
@@ -49,9 +59,33 @@ class DDIM:
             clip_sample=clip_sample,
             clip_sample_range=clip_sample_range,
         )
+        # Keep on CPU; moved to device lazily in _alphas_at
+        self._ac_cpu = self.scheduler.alphas_cumprod
 
-    def sample_timesteps(self, B: int, device: torch.device) -> torch.Tensor:
-        return torch.randint(0, self.num_train_timesteps, (B,), device=device)
+    def sample_timesteps(
+        self, B: int, device: torch.device, num_frames: Optional[int] = None
+    ) -> torch.Tensor:
+        shape = (B, num_frames) if num_frames is not None else (B,)
+        return torch.randint(0, self.num_train_timesteps, shape, device=device)
 
-    def add_noise(self, x_0, noise, timesteps):
-        return self.scheduler.add_noise(x_0, noise, timesteps)
+    def _alphas_at(self, timesteps: torch.Tensor) -> torch.Tensor:
+        """ᾱ_t for given [B] or [B, F] timesteps on the correct device."""
+        return self._ac_cpu.to(timesteps.device)[timesteps.long()]
+
+    def add_noise(
+        self, x_0: torch.Tensor, noise: torch.Tensor, timesteps: torch.Tensor
+    ) -> torch.Tensor:
+        a = self._alphas_at(timesteps)
+        sa, s1a = a.sqrt(), (1.0 - a).sqrt()
+        while sa.ndim < x_0.ndim:
+            sa  = sa.unsqueeze(-1)
+            s1a = s1a.unsqueeze(-1)
+        return sa * x_0 + s1a * noise
+
+    def get_target(
+        self,
+        x_0:       torch.Tensor,
+        noise:     torch.Tensor,
+        timesteps: torch.Tensor = None,   # unused
+    ) -> torch.Tensor:
+        return noise   # epsilon prediction always targets the noise
