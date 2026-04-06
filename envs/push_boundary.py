@@ -56,19 +56,26 @@ from mani_skill.utils.registration import register_env
 from mani_skill.utils.structs import Pose
 from mani_skill.utils.structs.types import Array, GPUMemoryConfig, SimConfig
 
+import envs.floating_gripper
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Shared geometry constants
 # ──────────────────────────────────────────────────────────────────────────────
 BOUNDARY_CENTER_X = -0.135
 BOUNDARY_CENTER_Y =  0.00
-BOUNDARY_HALF_X   =  0.18
-BOUNDARY_HALF_Y   =  0.30
+# BOUNDARY_HALF_X   =  0.18
+# BOUNDARY_HALF_Y   =  0.30
+
+BOUNDARY_HALF_X   =  0.25
+BOUNDARY_HALF_Y   =  0.35
 
 STRIP_THICKNESS = 0.006
 STRIP_HALF_H    = 1e-4
 
 OUT_MARGIN = -0.005
+
+GRIPPER_Z_FIXED = 0.085
 
 # Cube block
 CUBE_HALF       = 0.025
@@ -165,7 +172,9 @@ class PushBoundaryEnv(BaseEnv):
     See module docstring for full parameter documentation.
     """
 
-    SUPPORTED_ROBOTS = ["panda_stick"]
+    # SUPPORTED_ROBOTS = ["panda_stick"]
+    SUPPORTED_ROBOTS = ["floating_gripper"]   # was ["panda_stick"]
+
     robot_init_qpos_noise: float = 0.00
 
     def __init__(
@@ -214,8 +223,11 @@ class PushBoundaryEnv(BaseEnv):
                             fov=1, near=0.01, far=100)
 
     # ── agent ─────────────────────────────────────────────────────────────────
-    def _load_agent(self, options: dict):
-        super()._load_agent(options, sapien.Pose(p=[-0.615, 0, 0]))
+    # def _load_agent(self, options: dict):
+    #     super()._load_agent(options, sapien.Pose(p=[-0.615, 0, 0]))
+        
+    def _load_agent(self, options):
+        super()._load_agent(options, sapien.Pose(p=[BOUNDARY_CENTER_X, 0, GRIPPER_Z_FIXED]))
 
     # ── scene ─────────────────────────────────────────────────────────────────
     def _load_scene(self, options: dict) -> None:
@@ -224,11 +236,12 @@ class PushBoundaryEnv(BaseEnv):
         )
         self.table_scene.build()
 
-        # Initial robot pose from valid starts
-        b    = self.num_envs
-        idx  = torch.randint(0, self.num_valid_starts, (b,), device=self.device)
-        qpos = torch.from_numpy(self.valid_starts[idx.cpu().numpy()]).float().to(self.device)
-        self.agent.reset(qpos)
+        # Only reset qpos for robots that have joints (not the floating gripper)
+        if self.robot_uids != "floating_gripper":
+            b    = self.num_envs
+            idx  = torch.randint(0, self.num_valid_starts, (b,), device=self.device)
+            qpos = torch.from_numpy(self.valid_starts[idx.cpu().numpy()]).float().to(self.device)
+            self.agent.reset(qpos)
 
         # ── main block ────────────────────────────────────────────────────────
         if self.shape == "circle":
@@ -363,10 +376,11 @@ class PushBoundaryEnv(BaseEnv):
             b = len(env_idx)
             self.table_scene.initialize(env_idx)
 
-            # Robot
-            idx  = torch.randint(0, self.num_valid_starts, (b,), device=self.device)
-            qpos = torch.from_numpy(self.valid_starts[idx.cpu().numpy()]).float().to(self.device)
-            self.agent.reset(qpos)
+            # Only reset qpos for robots that have joints
+            if self.robot_uids != "floating_gripper":
+                idx  = torch.randint(0, self.num_valid_starts, (b,), device=self.device)
+                qpos = torch.from_numpy(self.valid_starts[idx.cpu().numpy()]).float().to(self.device)
+                self.agent.reset(qpos)
 
             # Boundary strips
             bx, by = BOUNDARY_CENTER_X, BOUNDARY_CENTER_Y

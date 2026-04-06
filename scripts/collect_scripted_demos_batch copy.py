@@ -404,18 +404,114 @@ def run_gpu(args: argparse.Namespace):
 
 
 # ---------------------------------------------------------------------------
+# CPU path
+# ---------------------------------------------------------------------------
+
+def run_cpu(args: argparse.Namespace):
+    N          = args.num_envs
+    rng_master = np.random.default_rng(args.seed)
+    w_seeds    = [int(rng_master.integers(2**31)) for _ in range(N)]
+
+    # Probe block dims before forking
+    _probe = gym.make(
+        "PushBoundary",
+        obs_mode="state", control_mode="floating_vel",
+        render_mode=None, sim_backend="cpu",
+        num_envs=1, shape="cube", num_extra_blocks=0,
+        robot_uids="floating_gripper",
+    )
+    hx = _probe.unwrapped.block_dims.half_x
+    hy = _probe.unwrapped.block_dims.half_y
+    _probe.close()
+
+    vec_env = gym.vector.AsyncVectorEnv(
+        [_make_env_fn(record_dir=args.record_dir,
+                      worker_seed=w_seeds[i], worker_idx=i,
+                      hx=hx, hy=hy)
+         for i in range(N)],
+        context="spawn",
+    )
+
+    rngs     = [np.random.default_rng(rng_master.integers(2**31)) for _ in range(N)]
+    policies = [FaceApproachPushPolicy() for _ in range(N)]
+    block_xy = np.array([BCX, BCY])
+
+    def init_policies_from_info(info):
+        # AsyncVectorEnv stacks info values into (N,) arrays keyed by field name
+        yaws  = np.asarray(info.get("init_block_yaw",  np.zeros(N)),  dtype=float)
+        faces = np.asarray(info.get("init_face_index", np.zeros(N)),  dtype=int)
+        gxs   = np.asarray(info.get("init_gx", np.full(N, BCX + 0.12)), dtype=float)
+        gys   = np.asarray(info.get("init_gy", np.full(N, BCY)),         dtype=float)
+        for i in range(N):
+            policies[i].reset(np.array([gxs[i], gys[i]]), block_xy,
+                               float(yaws[i]), hx, hy, rngs[i],
+                               initial_face=int(faces[i]))
+
+    obs, info = vec_env.reset(seed=w_seeds)
+    init_policies_from_info(info)
+
+    completed   = 0
+    alive_steps = np.zeros(N, dtype=int)
+    total_steps = 0
+    t0          = time.time()
+
+    print(f"CPU batch: {N} workers  target={args.num_demos} demos")
+
+    while completed < args.num_demos:
+        tcp_poses   = np.asarray(obs["extra"]["tcp_pose"],   dtype=np.float32).reshape(N, -1)
+        block_poses = np.asarray(obs["extra"]["block_pose"], dtype=np.float32).reshape(N, -1)
+
+        actions = np.zeros((N, 2), dtype=np.float32)
+        for i in range(N):
+            q    = block_poses[i, 3:7]
+            bq   = np.array([q[1], q[2], q[3], q[0]])
+            byaw = float(Rotation.from_quat(bq).as_euler("xyz")[2])
+            actions[i] = policies[i].act(tcp_poses[i, :2], block_poses[i, :2], byaw)
+
+        obs, _, terminated, truncated, _ = vec_env.step(actions)
+        total_steps  += N
+        alive_steps  += 1
+
+        dones = (np.asarray(terminated, bool)
+               | np.asarray(truncated,  bool)
+               | (alive_steps >= args.max_episode_steps))
+
+        if dones.any():
+            for i in np.where(dones)[0]:
+                completed += 1
+                elapsed    = time.time() - t0
+                print(f"  [{completed:>5d}/{args.num_demos}]  worker={i}  "
+                      f"steps={alive_steps[i]}  fps={total_steps/elapsed:.0f}")
+                alive_steps[i] = 0
+
+            if completed >= args.num_demos:
+                break
+
+            # Workers generate fresh init internally; main process reads back via info
+            obs, info = vec_env.reset()
+            init_policies_from_info(info)
+
+    vec_env.close()
+    elapsed = time.time() - t0
+    print(f"\nDone. {completed} demos  {elapsed:.1f}s  ({total_steps/elapsed:.0f} steps/s)")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 def run(args: argparse.Namespace):
     print(
         f"PushBoundary batched face-push collection\n"
-        f"  num_envs={args.num_envs}  "
+        f"  backend={args.backend}  num_envs={args.num_envs}  "
         f"target_demos={args.num_demos}\n"
         f"  max_episode_steps={args.max_episode_steps}  "
         f"record_dir={args.record_dir}"
     )
-    run_gpu(args)
+    if args.backend == "gpu":
+        run_gpu(args)
+    else:
+        run_cpu(args)
 
 
 def parse_args() -> argparse.Namespace:
@@ -423,11 +519,13 @@ def parse_args() -> argparse.Namespace:
         description="Batched face-push demo collection for PushBoundary."
     )
     p.add_argument("--num_envs",          type=int, default=8)
-    p.add_argument("--num_demos",         type=int, default=1000)
+    p.add_argument("--num_demos",         type=int, default=200)
     p.add_argument("--max_episode_steps", type=int, default=400)
     p.add_argument("--seed",              type=int, default=None)
     p.add_argument("--record_dir",        type=str,
                    default="demos/PushBoundary/face_push_batch_v2")
+    p.add_argument("--backend",           type=str, default="cpu",
+                   choices=["cpu", "gpu"])
     return p.parse_args()
 
 

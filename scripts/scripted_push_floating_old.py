@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Scripted autonomous policy for the unified Push environment (PushBoundary).
+Uses the FloatingGripper agent with a 3-DOF velocity action: [vx, vy, omega_z].
 Cube shape only.
 """
 
@@ -19,6 +20,8 @@ sys.path.insert(0, str(_HERE.parent))
 import gymnasium as gym
 from mani_skill.utils.wrappers.record import RecordEpisode
 
+import packages.Planning_wrapper.envs.floating_gripper_old  # noqa: F401 — triggers @register_agent()
+
 from envs.push_boundary import (
     BOUNDARY_CENTER_X as BCX,
     BOUNDARY_CENTER_Y as BCY,
@@ -26,13 +29,15 @@ from envs.push_boundary import (
     BOUNDARY_HALF_Y   as BHY,
 )
 
-EE_Z = 0.024
-
 MIN_X = BCX - BHX - 0.025
 MAX_X = BCX + BHX + 0.025
 MIN_Y = BCY - BHY - 0.025
 MAX_Y = BCY + BHY + 0.025
 
+
+# -----------------------------------------------------------------------------
+# Observation helpers
+# -----------------------------------------------------------------------------
 
 def _get_xyz(pose_p) -> np.ndarray:
     try:
@@ -45,7 +50,7 @@ def _get_xyz(pose_p) -> np.ndarray:
 
 
 def _get_yaw(pose_q) -> float:
-    """Extract yaw from a SAPIEN/ManiSkill quaternion [w, x, y, z]."""
+    """Extract yaw from a SAPIEN quaternion [w, x, y, z]."""
     try:
         import torch
         if isinstance(pose_q, torch.Tensor):
@@ -53,8 +58,7 @@ def _get_yaw(pose_q) -> float:
     except ImportError:
         pass
     q = np.asarray(pose_q, dtype=np.float64).reshape(-1)
-    # SAPIEN: [w, x, y, z] → scipy from_quat expects [x, y, z, w]
-    r = Rotation.from_quat([q[1], q[2], q[3], q[0]])
+    r = Rotation.from_quat([q[1], q[2], q[3], q[0]])  # scipy: [x, y, z, w]
     return float(r.as_euler("xyz")[2])
 
 
@@ -125,15 +129,22 @@ def _segment_hits_obb(
 # -----------------------------------------------------------------------------
 
 class ScriptedPushPolicy:
+    """
+    Produces 3-DOF velocity commands: [vx, vy, omega_z].
 
-    PUSH_STEPS        = 100
-    ARRIVE_THRESH     = 0.018
-    APPROACH_TIMEOUT  = 120
-    XY_SPEED          = 0.20
-    PUSH_SPEED        = 0.20
-    PUSH_CONTACT_DIST = 0.05
-    PUSH_TIMEOUT      = 150
-    PUSH_TARGET_EPS   = 0.015
+    omega_z is always 0 here — the gripper is a cylinder so rotation
+    doesn't matter for pushing.  A future version could use it to align
+    a non-circular gripper to the block face.
+    """
+
+    PUSH_STEPS          = 20
+    ARRIVE_THRESH       = 0.018
+    APPROACH_TIMEOUT    = 120
+    XY_SPEED            = 0.20      # m/s  — velocity command magnitude
+    PUSH_SPEED          = 0.20      # m/s
+    PUSH_CONTACT_DIST   = 0.05
+    PUSH_TIMEOUT        = 150
+    PUSH_TARGET_EPS     = 0.015
     STANDOFF_DIST_RANGE = (0.06, 0.10)
     CUBE_CLEARANCE      = 0.035
 
@@ -170,13 +181,71 @@ class ScriptedPushPolicy:
     # -------------------------------------------------------------------------
     # Main loop
     # -------------------------------------------------------------------------
+    # def act(self, ee_xy, block_xy, block_angle=0.0):
+    #     self._block_angle = block_angle
+    #     self._phase_step += 1
 
-    def act(
-        self,
-        ee_xy: np.ndarray,
-        block_xy: np.ndarray,
-        block_angle: float = 0.0,
-    ) -> np.ndarray:
+    #     if self._phase == "pick_new":
+    #         self._reposition(ee_xy, block_xy)
+
+    #     elif self._phase == "approach":
+    #         # Drain waypoints until we have one we haven't reached yet
+    #         while self._waypoint_queue:
+    #             self._move_tgt = self._waypoint_queue[0]
+    #             if np.linalg.norm(ee_xy - self._move_tgt) < self.ARRIVE_THRESH:
+    #                 self._waypoint_queue.pop(0)
+    #             else:
+    #                 break
+    #         else:
+    #             # Queue empty — head for standoff
+    #             self._move_tgt = self._standoff(block_xy)
+
+    #         at_standoff = (
+    #             not self._waypoint_queue
+    #             and np.linalg.norm(ee_xy - self._standoff(block_xy)) < self.ARRIVE_THRESH
+    #         )
+    #         if at_standoff or self._phase_step >= self.APPROACH_TIMEOUT:
+    #             self._phase              = "push"
+    #             self._phase_step         = 0
+    #             self._push_contact_steps = 0
+
+    #     elif self._phase == "push":
+    #         if np.linalg.norm(ee_xy - block_xy) < self.PUSH_CONTACT_DIST:
+    #             self._push_contact_steps += 1
+    #         if self._push_contact_steps >= self.PUSH_STEPS or self._phase_step >= self.PUSH_TIMEOUT:
+    #             self._reposition(ee_xy, block_xy)
+
+    #     # # ── velocity command ──────────────────────────────────────────────────────
+    #     # if self._phase == "push":
+    #     #     # Always drive toward block — don't call _reposition mid-velocity-compute
+    #     #     vel_xy = self._toward(ee_xy, block_xy + self._push_dir * 0.03, self.PUSH_SPEED)
+    #     # else:
+    #     #     vel_xy = self._toward(ee_xy, self._move_tgt, self.XY_SPEED)
+
+    #     # # Workspace clamp
+    #     # next_xy = ee_xy + vel_xy * (1.0 / 20.0)
+    #     # if not (MIN_X < next_xy[0] < MAX_X):
+    #     #     vel_xy[0] = 0.0
+    #     # if not (MIN_Y < next_xy[1] < MAX_Y):
+    #     #     vel_xy[1] = 0.0
+
+    #     # return np.array([vel_xy[0], vel_xy[1], 0.0], dtype=np.float32)
+    #     # Instead of velocity, just return the target position directly
+    #     if self._phase == "push":
+    #         target_xy = block_xy + self._push_dir * 0.03
+    #     else:
+    #         target_xy = self._move_tgt
+
+    #     return np.array([target_xy[0], target_xy[1]], dtype=np.float32)
+    
+    def _toward(src: np.ndarray, dst: np.ndarray, max_delta: float) -> np.ndarray:
+        d = dst - src
+        dist = np.linalg.norm(d)
+        if dist < 1e-6:
+            return np.zeros(2)
+        return d / dist * min(dist, max_delta)   # never overshoot
+    
+    def act(self, ee_xy, block_xy, block_angle=0.0):
         self._block_angle = block_angle
         self._phase_step += 1
 
@@ -184,14 +253,12 @@ class ScriptedPushPolicy:
             self._reposition(ee_xy, block_xy)
 
         elif self._phase == "approach":
-            if self._waypoint_queue:
+            while self._waypoint_queue:
                 self._move_tgt = self._waypoint_queue[0]
                 if np.linalg.norm(ee_xy - self._move_tgt) < self.ARRIVE_THRESH:
                     self._waypoint_queue.pop(0)
-                    self._move_tgt = (
-                        self._waypoint_queue[0] if self._waypoint_queue
-                        else self._standoff(block_xy)
-                    )
+                else:
+                    break
             else:
                 self._move_tgt = self._standoff(block_xy)
 
@@ -207,43 +274,24 @@ class ScriptedPushPolicy:
         elif self._phase == "push":
             if np.linalg.norm(ee_xy - block_xy) < self.PUSH_CONTACT_DIST:
                 self._push_contact_steps += 1
-
             if self._push_contact_steps >= self.PUSH_STEPS or self._phase_step >= self.PUSH_TIMEOUT:
                 self._reposition(ee_xy, block_xy)
 
-        # ── Velocity delta ────────────────────────────────────────────────────
+        # ── delta position command ─────────────────────────────────────────────
         if self._phase == "push":
-            push_target = block_xy + self._push_dir * 0.05
-            if np.linalg.norm(ee_xy - push_target) < self.PUSH_TARGET_EPS:
-                self._reposition(ee_xy, block_xy)
-                dxy = self._toward(ee_xy, block_xy + self._push_dir * 0.05, self.PUSH_SPEED)
-            else:
-                dxy = self._toward(ee_xy, push_target, self.PUSH_SPEED)
+            target = block_xy + self._push_dir * 0.03
         else:
-            dxy = self._toward(ee_xy, self._move_tgt, self.XY_SPEED)
+            target = self._move_tgt
 
-        # Workspace clamp
-        next_xy = np.clip(ee_xy + dxy, [MIN_X, MIN_Y], [MAX_X, MAX_Y])
-        clipped = next_xy - ee_xy
-
-        # If we hit a wall hard mid-approach, skip straight to push.
-        if np.linalg.norm(dxy) > 1e-6 and np.linalg.norm(clipped) / np.linalg.norm(dxy) < 0.3:
-            if self._phase == "approach":
-                self._waypoint_queue = []
-                self._phase, self._phase_step, self._push_contact_steps = "push", 0, 0
-            elif self._phase == "push":
-                self._reposition(ee_xy, block_xy)
-
-        action = np.zeros(6, dtype=np.float32)
-        action[0], action[1] = float(clipped[0]), float(clipped[1])
-        return action
+        delta = self._toward(ee_xy, target, 0.01)
+        print(f"phase={self._phase} step={self._phase_step} contact_steps={self._push_contact_steps} dist_to_block={np.linalg.norm(ee_xy - block_xy):.3f}")
+        return np.array([delta[0], delta[1]], dtype=np.float32)
 
     # -------------------------------------------------------------------------
     # Cube repositioning
     # -------------------------------------------------------------------------
 
     def _reposition(self, ee_xy: np.ndarray, block_xy: np.ndarray):
-        """Pick the best inward face, plan a collision-free path to its standoff."""
         self._push_dir           = self._best_push_dir(block_xy)
         self._push_contact_steps = 0
         self._standoff_dist      = self.rng.uniform(*self.STANDOFF_DIST_RANGE)
@@ -257,9 +305,6 @@ class ScriptedPushPolicy:
         self._move_tgt       = waypoints[0] if waypoints else standoff
 
     def _best_push_dir(self, block_xy: np.ndarray) -> np.ndarray:
-        """Face whose outward normal most aligns with toward-centre.
-        Naturally selects the inward face near edges — no separate rescue needed.
-        """
         toward_center = np.array([BCX, BCY]) - block_xy
         normals = _cube_face_normals(self._block_angle)
         scores  = [float(np.dot(n, toward_center)) for n in normals]
@@ -271,7 +316,6 @@ class ScriptedPushPolicy:
     def _safe_path(
         self, ee_xy: np.ndarray, block_xy: np.ndarray, standoff: np.ndarray
     ) -> list[np.ndarray]:
-        """Waypoints routing around the cube's padded OBB to the standoff."""
         hw_x = self.block_half_x + self.CUBE_CLEARANCE
         hw_y = self.block_half_y + self.CUBE_CLEARANCE
 
@@ -331,12 +375,12 @@ def run(args: argparse.Namespace):
     env = gym.make(
         "PushBoundary",
         obs_mode="state",
-        control_mode="pd_ee_delta_pose",
+        control_mode="floating_vel",
         render_mode="all",
         sim_backend="auto",
         shape=args.shape,
         num_extra_blocks=args.num_extra_blocks,
-        
+        robot_uids="floating_gripper",
     )
     env = RecordEpisode(
         env,
@@ -367,17 +411,17 @@ def run(args: argparse.Namespace):
         f"steps={args.num_steps}"
     )
     print(f"  block_dims = {base_env.block_dims}")
+    print(f"  action space = {env.action_space}")
 
     while total_steps < args.num_steps:
         ee_xyz    = _get_xyz(base_env.agent.tcp.pose.p)
         block_xyz = _get_xyz(base_env.block.pose.p)
         block_yaw = _get_yaw(base_env.block.pose.q)
 
-        action    = policy.act(ee_xyz[:2], block_xyz[:2], block_yaw)
-        action[2] = -(ee_xyz[2] - EE_Z)
+        # 3-element action: [vx, vy, omega_z]
+        # No z correction needed — the velocity controller holds z fixed
+        action = policy.act(ee_xyz[:2], block_xyz[:2], block_yaw)
 
-        # action[0] = 0.0   # Stop X completely
-        # action[1] = 0.1   # Max delta Y
         obs, reward, terminated, truncated, info = env.step(action)
         total_steps += 1
         alive_steps += 1
