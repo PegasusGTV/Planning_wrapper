@@ -599,7 +599,7 @@ def parse_args():
                      help="HDF5 demo file (ground-truth actions replayed as predictions).")
 
     # ── Conversion (only used with --raw_npz) ────────────────────────────────
-    p.add_argument("--conversion_mode", type=str, default="3d",
+    p.add_argument("--conversion_mode", type=str, default="2d",
                    choices=["3d", "2d"],
                    help="Which converter to apply to --raw_npz input.")
 

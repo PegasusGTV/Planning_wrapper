@@ -276,9 +276,72 @@ def convert_from_2D(prediction_dict: dict) -> dict:
     """
     Convert 2D top-down predictions into the standardised playback dict.
 
-    TODO: implement once 2D prediction format is finalised.
+    Expected input (raw 2D NPZ / dict)
+    ---------------------------------
+        states    (T, 4)  in prediction frame, ordered:
+            [tcp_x, tcp_y, block_x, block_y]
+        target_xy (2,) optional, in the same prediction frame.
+
+    Output (standardised playback dict)
+    ----------------------------------
+        initial_block_pos   (3,)   always CANONICAL_BLOCK_POS
+        initial_block_quat  (4,)   [w,x,y,z] (identity; yaw is not observable from 2D)
+        initial_gripper_xy  (2,)
+        predicted_actions   (T-1, 2)
+        predicted_block_pos (T-1, 3)
+        target_xy           (2,) or None   world-frame target XY
+
+    Coordinate mapping
+    ------------------
+    The entire scene is shifted so the predicted block starts at CANONICAL_BLOCK_POS
+    in the simulator while preserving the relative gripper–block offset at t=0.
     """
-    raise NotImplementedError("convert_from_2D is not yet implemented.")
+    states = np.asarray(prediction_dict["states"], dtype=np.float32)
+    if states.ndim != 2 or states.shape[1] != 4:
+        raise ValueError(f"'states' must have shape (T, 4); got {states.shape}")
+    if states.shape[0] < 2:
+        raise ValueError(f"'states' must have at least 2 frames; got T={states.shape[0]}")
+
+    tcp_xy = states[:, 0:2]
+    block_xy = states[:, 2:4]
+
+    world_offset_xy = CANONICAL_BLOCK_POS[:2] - block_xy[0]
+    tcp_xy_world = (tcp_xy + world_offset_xy).astype(np.float32)
+    block_xy_world = (block_xy + world_offset_xy).astype(np.float32)
+
+    z_const = float(CANONICAL_BLOCK_POS[2])
+    block_positions_world = np.concatenate(
+        [block_xy_world, np.full((block_xy_world.shape[0], 1), z_const, dtype=np.float32)],
+        axis=1,
+    )
+
+    initial_block_pos = CANONICAL_BLOCK_POS.copy()
+    initial_block_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    initial_gripper_xy = tcp_xy_world[0].copy()
+
+    predicted_actions = np.diff(tcp_xy_world, axis=0).astype(np.float32)
+    predicted_block_pos = block_positions_world[1:].astype(np.float32)
+
+    target_xy = prediction_dict.get("target_xy", None)
+    if target_xy is not None:
+        target_xy = np.asarray(target_xy, dtype=np.float32).ravel()
+        if target_xy.shape != (2,):
+            raise ValueError(f"'target_xy' must have shape (2,); got {target_xy.shape}")
+        target_xy = (target_xy + world_offset_xy).astype(np.float32)
+
+    return dict(
+        initial_block_pos=initial_block_pos,
+        initial_block_quat=initial_block_quat,
+        initial_gripper_xy=initial_gripper_xy,
+        predicted_actions=predicted_actions,
+        predicted_block_pos=predicted_block_pos,
+        target_xy=target_xy,
+        tcp_positions=np.concatenate(
+            [tcp_xy_world, np.full((tcp_xy_world.shape[0], 1), z_const, dtype=np.float32)],
+            axis=1,
+        ).astype(np.float32),
+        block_positions=block_positions_world.astype(np.float32),
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
