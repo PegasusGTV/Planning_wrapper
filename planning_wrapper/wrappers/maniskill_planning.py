@@ -1,9 +1,28 @@
 from __future__ import annotations
+import sys
+from pathlib import Path
 from typing import Any, Dict, Optional
+
 import gymnasium as gym
 import mani_skill.envs
 import numpy as np
 from ..adapters import BaseTaskAdapter
+
+_POLARIS_ROOT = Path(__file__).resolve().parents[2]
+if str(_POLARIS_ROOT) not in sys.path:
+    sys.path.insert(0, str(_POLARIS_ROOT))
+
+from skills.metrics import (  # noqa: E402
+    lookahead_reach_mppi_score,
+    lookahead_rl_score,
+    lookahead_rollout_score,
+    select_reach_backend,
+    select_skill_backend,
+    tcp_manipulability,
+    weighted_reach_score,
+    unwrap_maniskill_root,
+)
+
 
 class ManiSkillPlanningWrapper:
     def __init__(self, env: Any, adapter: Optional[BaseTaskAdapter] = None, hide_obj_orientation: bool = False):

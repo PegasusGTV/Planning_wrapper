@@ -1,0 +1,12 @@
+{
+  "_comment": "LLM_BACKEND: 'gemini' (VertexAI) or 'openai' (OpenAI-compatible). Inferred from model name if omitted.",
+  "LLM_BACKEND": "openai",
+
+  "_comment_gemini": "Required for LLM_BACKEND=gemini",
+  "VERTEX_PROJECT": "your-gcp-project-id",
+  "VERTEX_LOCATION": "us-central1",
+
+  "_comment_openai": "Required for LLM_BACKEND=openai",
+  "OPENAI_API_KEY": "sk-...",
+  "OPENAI_BASE_URL": "https://ai-gateway.andrew.cmu.edu"
+}
